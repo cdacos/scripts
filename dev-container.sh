@@ -107,17 +107,6 @@ get_claude_json() {
     fi
 }
 
-# Check if Dockerfile.dev uses a Debian base image
-# Debian ships git 2.47 which lacks --relative-paths (added in 2.48)
-is_debian_base() {
-    repo_root="$1"
-    base_image=$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]\+\).*/\1/p' "$repo_root/Dockerfile.dev" | head -1)
-    case "$base_image" in
-        debian:*|debian|*/debian:*|*/debian) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 # Get container status: running, stopped, or none
 get_container_status() {
     container_name="$1"
@@ -328,13 +317,8 @@ cmd_create() {
     mkdir -p "$worktrees_dir/$port"
     # Use relative paths so both the worktree→repo and repo→worktree gitdir
     # links are portable across environments (e.g. Windows drive letters vs WSL)
-    # --relative-paths requires git 2.48+; Debian ships 2.47, so skip it there
     rel_worktree="../$(basename "$worktrees_dir")/$port/$branch"
-    worktree_flags=""
-    if ! is_debian_base "$repo_root"; then
-        worktree_flags="--relative-paths"
-    fi
-    git -C "$repo_root" worktree add $worktree_flags "$rel_worktree" "$branch"
+    git -C "$repo_root" worktree add --relative-paths "$rel_worktree" "$branch"
 
     # Copy appsettings.Local.json files from repo root to worktree
     info "Copying local settings files..."
@@ -353,7 +337,8 @@ cmd_create() {
 
     printf "\n"
     success "Container ready!"
-    printf "Port ${YELLOW}%s${NC} → container:8000\n\n" "$port"
+    printf "Port ${YELLOW}%s${NC} → container:8000\n" "$port"
+    printf "If your container's git is older than 2.48, run: ${CYAN}git config --unset extensions.relativeWorktrees${NC}\n\n"
 
     # Enter container as dev user
     docker exec -it -u dev "$container_name" bash

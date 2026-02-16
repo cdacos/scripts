@@ -507,8 +507,22 @@ cmd_completion() {
             cat <<'EOF'
 _container_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
     local branches=$(git branch --format='%(refname:short)' 2>/dev/null)
-    COMPREPLY=($(compgen -W "$branches" -- "$cur"))
+    local repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    local worktree_branches=""
+    if [ -n "$repo_root" ]; then
+        local wt_dir="$(dirname "$repo_root")/$(basename "$repo_root").worktrees"
+        if [ -d "$wt_dir" ]; then
+            worktree_branches=$(find "$wt_dir" -mindepth 2 -maxdepth 2 -type d -exec basename {} \;)
+        fi
+    fi
+    local all=$(printf '%s\n%s' "$branches" "$worktree_branches" | sort -u)
+    if [ "$prev" = "kill" ]; then
+        COMPREPLY=($(compgen -W "$worktree_branches" -- "$cur"))
+    else
+        COMPREPLY=($(compgen -W "kill $all" -- "$cur"))
+    fi
 }
 complete -F _container_complete dev-container.sh
 EOF
@@ -516,8 +530,22 @@ EOF
         zsh)
             cat <<'EOF'
 _container_complete() {
+    local repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
     local branches=(${(f)"$(git branch --format='%(refname:short)' 2>/dev/null)"})
-    compadd -a branches
+    local worktree_branches=()
+    if [ -n "$repo_root" ]; then
+        local wt_dir="$(dirname "$repo_root")/$(basename "$repo_root").worktrees"
+        if [ -d "$wt_dir" ]; then
+            worktree_branches=(${(f)"$(find "$wt_dir" -mindepth 2 -maxdepth 2 -type d -exec basename {} \;)"})
+        fi
+    fi
+    local all=(${(u)branches} ${(u)worktree_branches})
+    if (( CURRENT == 3 )) && [[ "${words[2]}" == "kill" ]]; then
+        compadd -a worktree_branches
+    elif (( CURRENT == 2 )); then
+        compadd kill
+        compadd -a all
+    fi
 }
 compdef _container_complete dev-container.sh
 EOF

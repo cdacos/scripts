@@ -264,9 +264,9 @@ find_next_port() {
 
     # If no existing ports, ask user for starting port
     if [ "$has_ports" = false ]; then
-        printf "\n"
-        printf "${CYAN}No existing port assignments found.${NC}\n"
-        printf "Enter starting port number (e.g., 9000, 10000, 15000): "
+        printf "\n" >&2
+        printf "${CYAN}No existing port assignments found.${NC}\n" >&2
+        printf "Enter starting port number (e.g., 9000, 10000, 15000): " >&2
         read -r start_port
 
         # Validate input is a number

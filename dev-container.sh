@@ -29,7 +29,7 @@ Assumptions:
   - macOS: Claude credentials read from Keychain ("Claude Code-credentials")
   - Linux: Claude credentials from ~/.claude/.credentials.json (if exists)
   - ~/.claude.json copied in (skips onboarding)
-  - ~/.claude/projects and ~/.claude/history.jsonl mounted (conversation history)
+  - ~/.claude mounted (settings, skills, history, projects, etc.)
   - Main repo mounted (so git commands work in worktree)
   - Worktrees created in ../{repo}.worktrees/{port}/{branch}/ (sibling to repo)
   - Container dev user UID/GID matches host user (volume permission parity)
@@ -169,8 +169,7 @@ start_container() {
         -e "CLAUDE_JSON=${claude_json}" \
         -v "${repo_root}:${repo_root}" \
         -v "${worktree_path}:${worktree_path}" \
-        -v "${HOME}/.claude/projects:/home/dev/.claude/projects:rw" \
-        -v "${HOME}/.claude/history.jsonl:/home/dev/.claude/history.jsonl:rw" \
+        -v "${HOME}/.claude:/home/dev/.claude:rw" \
         -w "${worktree_path}" \
         "$image_name" \
         tail -f /dev/null

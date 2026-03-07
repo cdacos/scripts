@@ -1,0 +1,1 @@
+ACTION=="change", SUBSYSTEM=="drm", RUN+="/usr/bin/su carlos -c '/home/carlos/hdmi-audio-fix.sh'"

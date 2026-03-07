@@ -1,0 +1,15 @@
+[Unit]
+Description=Jellyfin Desktop Client
+After=seatd.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStartPre=/bin/bash -c 'pkill -u carlos pipewire || true; pkill -u carlos wireplumber || true; sleep 1'
+ExecStart=/home/carlos/jellyfin.sh
+ExecStop=/bin/bash -c 'pkill -u carlos cage; pkill -u carlos pipewire; pkill -u carlos wireplumber'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

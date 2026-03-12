@@ -146,8 +146,8 @@ build_image() {
         --build-arg HOST_GID="$(id -g)" \
         -t "$image_name" "$repo_root"
 
-    # Clean up temp file
-    [ -n "$token_file" ] && rm -f "$token_file"
+    # Clean up temp file if it exists
+    [ -n "$token_file" ] && rm -f "$token_file" || true
 }
 
 # Start a new container

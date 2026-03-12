@@ -29,7 +29,7 @@ Assumptions:
   - macOS: Claude credentials read from Keychain ("Claude Code-credentials")
   - Linux: Claude credentials from ~/.claude/.credentials.json (if exists)
   - ~/.claude.json copied in (skips onboarding)
-  - ~/.claude mounted (settings, skills, history, projects, etc.)
+  - ~/.claude copied into container (isolated snapshot of settings, skills, etc.)
   - Main repo mounted (so git commands work in worktree)
   - Worktrees created in ../{repo}.worktrees/{port}/{branch}/ (sibling to repo)
   - Container dev user UID/GID matches host user (volume permission parity)
@@ -169,10 +169,25 @@ start_container() {
         -e "CLAUDE_JSON=${claude_json}" \
         -v "${repo_root}:${repo_root}" \
         -v "${worktree_path}:${worktree_path}" \
-        -v "${HOME}/.claude:/home/dev/.claude:rw" \
+        -v "${HOME}/.claude/projects:/home/dev/.claude/projects:rw" \
         -w "${worktree_path}" \
         "$image_name" \
         tail -f /dev/null
+
+    # Copy host ~/.claude config into container (isolated snapshot, not shared)
+    # Only copies essential config — skips large ephemeral dirs (projects/, debug/, telemetry/, etc.)
+    if [ -d "${HOME}/.claude" ]; then
+        info "Copying ~/.claude config into container..."
+        docker exec -u root "$container_name" mkdir -p /home/dev/.claude
+        tar -cf - -C "${HOME}/.claude" \
+            --include='./settings.json' \
+            --include='./CLAUDE.md' \
+            --include='./.credentials.json' \
+            --include='./skills' --include='./skills/*' \
+            --include='./plugins' --include='./plugins/*' \
+            . | docker exec -i -u root "$container_name" tar -xf - -C /home/dev/.claude
+        docker exec -u root "$container_name" chown -R dev:dev /home/dev/.claude
+    fi
 }
 
 # List all worktrees with their status

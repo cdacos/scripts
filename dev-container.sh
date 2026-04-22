@@ -170,6 +170,7 @@ start_container() {
         -v "${repo_root}:${repo_root}" \
         -v "${worktree_path}:${worktree_path}" \
         -v "${HOME}/.claude/projects:/home/dev/.claude/projects:rw" \
+        -v /var/run/docker.sock:/var/run/docker.sock \
         -w "${worktree_path}" \
         "$image_name" \
         tail -f /dev/null

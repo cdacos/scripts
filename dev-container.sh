@@ -12,12 +12,14 @@ Creates isolated dev environments using git worktrees + Docker containers.
 Each branch gets its own worktree and container with a unique port.
 
 Commands:
-  (no args)           List all worktrees and their container status
-  <branch>            Create or attach to container for branch (auto-slugified)
-  kill <branch>       Stop container, remove worktree and folder for branch
-  init <base-image>   Generate skeleton Dockerfile.dev (or .example if exists)
-  completion <shell>  Output shell completion code (bash or zsh)
-  -h, --help          Show this help
+  (no args)             List all worktrees and their container status
+  <branch>              Create or attach to container for branch (auto-slugified)
+  <name> --local        Create a container that mounts the current repo directly
+                        (no git worktree); multiple names share the same folder
+  kill <branch>         Stop container, remove worktree and folder for branch
+  init <base-image>     Generate skeleton Dockerfile.dev (or .example if exists)
+  completion <shell>    Output shell completion code (bash or zsh)
+  -h, --help            Show this help
 
 Environment variables:
   GITCONFIG                 Your ~/.gitconfig content (copied into container)
@@ -38,6 +40,8 @@ Assumptions:
 Examples:
   dev! feature-auth         # Create/attach to feature-auth branch
   dev! "Fix Bug #123"       # Slugified to fix-bug-123
+  dev! scratch --local      # Create container 'scratch' on the live repo
+  dev! scratch              # Re-attach to it later
   dev! kill feature-auth    # Remove container, worktree, and folder
   dev!                      # List all worktrees
 EOF
@@ -221,7 +225,9 @@ cmd_list() {
                 *)       status_colored="${RED}none${NC}" ;;
             esac
 
-            printf "%-8s %-30s " "$port" "$branch"
+            label="$branch"
+            [ -f "${branch_dir}.local" ] && label="$branch (local)"
+            printf "%-8s %-30s " "$port" "$label"
             printf "$status_colored\n"
         done
     done
@@ -289,21 +295,33 @@ find_next_port() {
     fi
 }
 
-# Create new worktree and container
+# Create new worktree and container (or local-mount container if local_mode=true)
 cmd_create() {
     repo_root="$1"
     branch="$2"
+    local_mode="${3:-false}"
     repo_name=$(get_repo_name "$repo_root")
     worktrees_dir=$(get_worktrees_dir "$repo_root")
     port=$(find_next_port "$repo_root")
-    worktree_path="$worktrees_dir/$port/$branch"
+    marker_dir="$worktrees_dir/$port/$branch"
     container_name="${repo_name}-${branch}"
     image_name="${repo_name}-dev"
 
+    if [ "$local_mode" = "true" ]; then
+        mount_path="$repo_root"
+    else
+        mount_path="$marker_dir"
+    fi
+
     printf "\n"
     info "Will create:"
-    printf "  Branch:    ${YELLOW}%s${NC}\n" "$branch"
-    printf "  Worktree:  ${YELLOW}%s/%s/%s${NC}\n" "$(basename "$worktrees_dir")" "$port" "$branch"
+    if [ "$local_mode" = "true" ]; then
+        printf "  Name:      ${YELLOW}%s${NC} (local)\n" "$branch"
+        printf "  Mount:     ${YELLOW}%s${NC}\n" "$repo_root"
+    else
+        printf "  Branch:    ${YELLOW}%s${NC}\n" "$branch"
+        printf "  Worktree:  ${YELLOW}%s/%s/%s${NC}\n" "$(basename "$worktrees_dir")" "$port" "$branch"
+    fi
     printf "  Container: ${YELLOW}%s${NC}\n" "$container_name"
     printf "  Port:      ${YELLOW}%s${NC} → 8000\n" "$port"
     printf "\n"
@@ -320,40 +338,46 @@ cmd_create() {
 
     printf "\n"
 
-    # Create branch from current HEAD
-    info "Creating branch '$branch'..."
-    git -C "$repo_root" branch "$branch" 2>/dev/null || {
-        # Branch might already exist, that's ok
-        info "Branch '$branch' already exists, using existing branch"
-    }
+    if [ "$local_mode" = "true" ]; then
+        info "Creating local marker at $(basename "$worktrees_dir")/$port/$branch..."
+        mkdir -p "$marker_dir"
+        touch "$marker_dir/.local"
+    else
+        # Create branch from current HEAD
+        info "Creating branch '$branch'..."
+        git -C "$repo_root" branch "$branch" 2>/dev/null || {
+            info "Branch '$branch' already exists, using existing branch"
+        }
 
-    # Create worktree directory
-    info "Creating worktree at $(basename "$worktrees_dir")/$port/$branch..."
-    mkdir -p "$worktrees_dir/$port"
-    # Use relative paths so both the worktree→repo and repo→worktree gitdir
-    # links are portable across environments (e.g. Windows drive letters vs WSL)
-    rel_worktree="../$(basename "$worktrees_dir")/$port/$branch"
-    git -C "$repo_root" worktree add --relative-paths "$rel_worktree" "$branch"
+        info "Creating worktree at $(basename "$worktrees_dir")/$port/$branch..."
+        mkdir -p "$worktrees_dir/$port"
+        # Use relative paths so both the worktree→repo and repo→worktree gitdir
+        # links are portable across environments (e.g. Windows drive letters vs WSL)
+        rel_worktree="../$(basename "$worktrees_dir")/$port/$branch"
+        git -C "$repo_root" worktree add --relative-paths "$rel_worktree" "$branch"
 
-    # Copy appsettings.Local.json files from repo root to worktree
-    info "Copying local settings files..."
-    find "$repo_root" -maxdepth 5 -name "appsettings.Local.json" | while read -r src_file; do
-        rel_path="${src_file#$repo_root/}"
-        dest_file="$worktree_path/$rel_path"
-        dest_dir=$(dirname "$dest_file")
-        if [ -d "$dest_dir" ]; then
-            cp "$src_file" "$dest_file"
-            info "  Copied $rel_path"
-        fi
-    done
+        info "Copying local settings files..."
+        find "$repo_root" -maxdepth 5 -name "appsettings.Local.json" | while read -r src_file; do
+            rel_path="${src_file#$repo_root/}"
+            dest_file="$marker_dir/$rel_path"
+            dest_dir=$(dirname "$dest_file")
+            if [ -d "$dest_dir" ]; then
+                cp "$src_file" "$dest_file"
+                info "  Copied $rel_path"
+            fi
+        done
+    fi
 
-    build_image "$image_name" "$repo_root" "$worktree_path"
-    start_container "$container_name" "$port" "$worktree_path" "$image_name" "$repo_root"
+    build_image "$image_name" "$repo_root" "$mount_path"
+    start_container "$container_name" "$port" "$mount_path" "$image_name" "$repo_root"
 
     printf "\n"
     success "Container ready!"
     printf "Port ${YELLOW}%s${NC} → container:8000\n" "$port"
-    printf "If your container's git is older than 2.48, run: ${CYAN}git config --unset extensions.relativeWorktrees${NC}\n\n"
+    if [ "$local_mode" != "true" ]; then
+        printf "If your container's git is older than 2.48, run: ${CYAN}git config --unset extensions.relativeWorktrees${NC}\n"
+    fi
+    printf "\n"
 
     # Enter container as dev user
     docker exec -it -u dev "$container_name" bash
@@ -370,14 +394,20 @@ cmd_run() {
     port_dir=$(dirname "$worktree_path")
     port=$(basename "$port_dir")
 
+    if [ -f "$worktree_path/.local" ]; then
+        mount_path="$repo_root"
+    else
+        mount_path="$worktree_path"
+    fi
+
     container_name="${repo_name}-${branch}"
     image_name="${repo_name}-dev"
     status=$(get_container_status "$container_name")
 
     case "$status" in
         none)
-            build_image "$image_name" "$repo_root" "$worktree_path"
-            start_container "$container_name" "$port" "$worktree_path" "$image_name" "$repo_root"
+            build_image "$image_name" "$repo_root" "$mount_path"
+            start_container "$container_name" "$port" "$mount_path" "$image_name" "$repo_root"
             ;;
         stopped)
             info "Starting stopped container '$container_name'..."
@@ -443,9 +473,13 @@ cmd_kill() {
             ;;
     esac
 
-    # Remove git worktree
-    info "Removing git worktree..."
-    git -C "$repo_root" worktree remove --force "$worktree_path"
+    if [ -f "$worktree_path/.local" ]; then
+        info "Removing local marker..."
+        rm -rf "$worktree_path"
+    else
+        info "Removing git worktree..."
+        git -C "$repo_root" worktree remove --force "$worktree_path"
+    fi
 
     # Remove port directory if empty
     if [ -d "$port_dir" ] && [ -z "$(ls -A "$port_dir")" ]; then
@@ -622,14 +656,27 @@ main() {
                 error "Invalid branch name"
             fi
 
+            # Detect --local flag (any position after the name)
+            local_mode=false
+            shift
+            for arg in "$@"; do
+                case "$arg" in
+                    --local) local_mode=true ;;
+                    *) error "Unknown option: $arg" ;;
+                esac
+            done
+
             # Find or create
             worktree_path=$(find_worktree "$repo_root" "$branch") && {
+                if [ "$local_mode" = "true" ]; then
+                    error "'$branch' already exists. Use 'dev! kill $branch' first, or pick another name."
+                fi
                 cmd_run "$worktree_path" "$repo_root"
                 exit 0
             }
 
             # Not found, create new
-            cmd_create "$repo_root" "$branch"
+            cmd_create "$repo_root" "$branch" "$local_mode"
             ;;
     esac
 }

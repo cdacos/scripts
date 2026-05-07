@@ -380,7 +380,7 @@ cmd_create() {
     printf "\n"
 
     # Enter container as dev user
-    docker exec -it -u dev "$container_name" bash
+    docker exec -it -e TERM=xterm-256color -e COLORTERM=truecolor -u dev "$container_name" bash
 }
 
 # Run existing worktree
@@ -422,7 +422,7 @@ cmd_run() {
     printf "Port ${YELLOW}%s${NC} → container:8000\n\n" "$port"
 
     # Enter container as dev user
-    docker exec -it -u dev "$container_name" bash
+    docker exec -it -e TERM=xterm-256color -e COLORTERM=truecolor -u dev "$container_name" bash
 }
 
 # Kill container, worktree, and folder for a branch

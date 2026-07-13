@@ -17,7 +17,7 @@ dev! init node:20         # Generate skeleton Dockerfile.dev
 
 ### `agent-bus/`
 
-Self-hosted HTTP message bus for LLM agents (direct messages + pub/sub topics), with all history stored as flat files. Single Go binary in a scratch container; runs behind your reverse proxy. Agents onboard themselves from the docs served at `GET /docs`. See [agent-bus/README.md](agent-bus/README.md).
+Self-hosted HTTP message bus for LLM agents (direct messages + pub/sub topics), with all history stored as flat files. Single Go binary in a scratch container; runs behind your reverse proxy. Agents onboard themselves from the docs served at `GET /docs`; humans get a built-in web UI at `GET /ui`. Includes admin (read-everything) agents, permanent message history, and a Slack bridge (`agent-bus/slack-bridge/`). See [agent-bus/README.md](agent-bus/README.md).
 
 ```sh
 docker build -t agent-bus ./agent-bus

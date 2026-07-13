@@ -18,6 +18,8 @@ Commands:
   send <agent> <body> [meta]  Send a direct message (meta = JSON object)
   inbox [wait-seconds]        List pending messages; optionally long-poll
   ack <message-id>            Acknowledge (remove) an inbox message
+  history [agent] [limit]     Your DM history, optionally with one agent
+  audit <agent> [limit]       Another agent's history (requires admin)
   pub <topic> <body> [meta]   Publish to a topic
   read <topic> [limit]        Read recent topic messages
   watch <topic>               Stream topic messages live (SSE; Ctrl-C to stop)
@@ -114,6 +116,20 @@ case "$cmd" in
         require_env
         [ -n "${1:-}" ] || error "Usage: bus.sh ack <message-id>"
         api DELETE "/inbox/$1" | pretty
+        ;;
+    history)
+        require_env
+        # First arg is a limit if numeric, otherwise an agent to filter by
+        case "${1:-}" in
+            '') api GET "/history?limit=50" | pretty ;;
+            *[!0-9]*) api GET "/history?with=$1&limit=${2:-50}" | pretty ;;
+            *) api GET "/history?limit=$1" | pretty ;;
+        esac
+        ;;
+    audit)
+        require_env
+        [ -n "${1:-}" ] || error "Usage: bus.sh audit <agent> [limit]"
+        api GET "/agents/$1/history?limit=${2:-50}" | pretty
         ;;
     pub)
         require_env

@@ -41,11 +41,13 @@ The main script. It pairs git worktrees with Docker containers so each branch ge
 
 ## Architecture: agent-bus/
 
-Self-hosted HTTP message bus so LLM agents (in dev containers, on other machines, in the cloud) can message each other. Single-file Go server (`main.go`, stdlib only) in a scratch container, designed to sit behind an existing reverse proxy that handles TLS.
+Self-hosted HTTP message bus so LLM agents (in dev containers, on other machines, in the cloud) can message each other. Small Go package (`main.go` + `ui.go`, stdlib only) in a scratch container, designed to sit behind an existing reverse proxy that handles TLS. The core principle: **the bus stays frozen; new integrations are clients** — the web UI is an embedded page using a normal agent token, and the Slack bridge (`agent-bus/slack-bridge/`, separate binary) is just another registered agent.
 
 - **Files are the storage layer, the service is the only writer.** Everything lives under `/data` (bind mount): `config/agents.json` (token sha256 hashes + topic ACLs, hot-reloaded on mtime change), per-agent `inbox/` (one JSON file per undelivered DM, removed on ack), per-agent `messages.jsonl`/`sent.jsonl` (permanent history), and `topics/<topic>/<date>.jsonl` logs. No database; backup = rsync of `/data`.
 - **Contention model:** per-file-path mutexes serialize appends; inbox writes are temp-file + atomic rename. The in-memory pubsub only *notifies* long-pollers (`GET /inbox?wait=`) and SSE watchers (`/topics/{t}/watch`) — durable delivery never depends on it, messages hit disk before notification.
-- **Auth:** bearer token per agent; only sha256 hashes are stored server-side. ACLs (`publish`/`subscribe` arrays, `*` and `prefix-*` wildcards) apply to topics; any registered agent may DM any other.
+- **Auth:** bearer token per agent; only sha256 hashes are stored server-side. ACLs (`publish`/`subscribe` arrays, `*` and `prefix-*` wildcards) apply to topics; any registered agent may DM any other. `"admin": true` grants read-only oversight (any agent's history via `/agents/{name}/history`, any topic) but never changes write behavior.
+- **History is permanent:** acking removes only the inbox copy; `GET /history` serves the merged sent+received archive. Nothing in the server deletes history files.
+- **Slack bridge:** Events API inbound (HMAC-verified; verification disabled with a loud warning if `SLACK_SIGNING_SECRET` is empty), `chat.postMessage` outbound. Slack threads round-trip via `meta.thread` (`"<channel>:<ts>"`); topic mirroring skips the bridge's own messages to prevent loops. Deliberately stdlib-only — no websockets/Socket Mode.
 - **Self-documenting:** `GET /docs` serves agent-oriented usage docs (the `docsMarkdown` constant in main.go) — new agents are onboarded by pointing them at that URL plus a token. Keep those docs in sync with any API change.
 - **Clients:** `bus.sh` at the repo root is a POSIX-sh curl/jq wrapper over the API; keep its commands in sync too. `dev-container.sh` passes host `AGENT_BUS_URL`/`AGENT_BUS_TOKEN` env vars into containers.
 

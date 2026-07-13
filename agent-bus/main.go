@@ -54,6 +54,9 @@ type AgentConfig struct {
 	TokenSHA256 string   `json:"token_sha256"`
 	Publish     []string `json:"publish"`
 	Subscribe   []string `json:"subscribe"`
+	// Admin grants read-only oversight: any agent's history, any topic.
+	// Writes are unaffected — admins send as themselves like everyone else.
+	Admin bool `json:"admin,omitempty"`
 }
 
 type Config map[string]AgentConfig
@@ -165,6 +168,10 @@ func (s *server) authenticate(r *http.Request) (string, *AgentConfig) {
 	return "", nil
 }
 
+func canRead(ac *AgentConfig, topic string) bool {
+	return ac.Admin || matchACL(ac.Subscribe, topic)
+}
+
 func matchACL(patterns []string, name string) bool {
 	for _, p := range patterns {
 		if p == "*" || p == name {
@@ -263,7 +270,67 @@ func (s *server) readInbox(agent string) ([]Message, error) {
 	return msgs, nil
 }
 
+// readHistory merges an agent's received and sent DM logs chronologically.
+// with filters to messages exchanged with one other agent; since/limit as in
+// topic reads. Self-DMs appear in both logs, so entries are deduped by ID.
+func (s *server) readHistory(agent, with, since string, limit int) []Message {
+	seen := map[string]bool{}
+	msgs := []Message{}
+	for _, f := range []string{"messages.jsonl", "sent.jsonl"} {
+		b, err := os.ReadFile(filepath.Join(s.dataDir, "agents", agent, f))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if line == "" {
+				continue
+			}
+			var m Message
+			if err := json.Unmarshal([]byte(line), &m); err != nil || seen[m.ID] {
+				continue
+			}
+			if with != "" && m.From != with && m.To != "agent:"+with {
+				continue
+			}
+			if since != "" && m.TS <= since {
+				continue
+			}
+			seen[m.ID] = true
+			msgs = append(msgs, m)
+		}
+	}
+	sort.Slice(msgs, func(i, j int) bool {
+		if msgs[i].TS != msgs[j].TS {
+			return msgs[i].TS < msgs[j].TS
+		}
+		return msgs[i].ID < msgs[j].ID
+	})
+	if len(msgs) > limit {
+		msgs = msgs[len(msgs)-limit:]
+	}
+	return msgs
+}
+
 // --- HTTP plumbing ---
+
+func parseListParams(r *http.Request) (limit int, since string, errMsg string) {
+	limit = 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return 0, "", "invalid limit"
+		}
+		limit = min(n, 1000)
+	}
+	if v := r.URL.Query().Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			return 0, "", "invalid since (want RFC3339): " + err.Error()
+		}
+		since = t.UTC().Format(tsFormat)
+	}
+	return limit, since, ""
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -319,6 +386,7 @@ func (s *server) handleWhoami(w http.ResponseWriter, _ *http.Request, caller str
 		"agent":     caller,
 		"publish":   ac.Publish,
 		"subscribe": ac.Subscribe,
+		"admin":     ac.Admin,
 	})
 }
 
@@ -408,6 +476,40 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request, caller string
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *server) handleHistory(w http.ResponseWriter, r *http.Request, caller string, _ *AgentConfig) {
+	s.serveHistory(w, r, caller)
+}
+
+func (s *server) handleAgentHistory(w http.ResponseWriter, r *http.Request, caller string, ac *AgentConfig) {
+	target := r.PathValue("name")
+	if !nameRe.MatchString(target) {
+		jsonErr(w, http.StatusBadRequest, "invalid agent name")
+		return
+	}
+	if target != caller && !ac.Admin {
+		jsonErr(w, http.StatusForbidden, "admin required to read another agent's history")
+		return
+	}
+	s.serveHistory(w, r, target)
+}
+
+func (s *server) serveHistory(w http.ResponseWriter, r *http.Request, agent string) {
+	limit, since, errMsg := parseListParams(r)
+	if errMsg != "" {
+		jsonErr(w, http.StatusBadRequest, errMsg)
+		return
+	}
+	with := r.URL.Query().Get("with")
+	if with != "" && !nameRe.MatchString(with) {
+		jsonErr(w, http.StatusBadRequest, "invalid with agent name")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"agent":    agent,
+		"messages": s.readHistory(agent, with, since, limit),
+	})
+}
+
 func (s *server) handlePublish(w http.ResponseWriter, r *http.Request, caller string, ac *AgentConfig) {
 	topic := r.PathValue("topic")
 	if !nameRe.MatchString(topic) {
@@ -439,27 +541,14 @@ func (s *server) handleTopicRead(w http.ResponseWriter, r *http.Request, _ strin
 		jsonErr(w, http.StatusBadRequest, "invalid topic name")
 		return
 	}
-	if !matchACL(ac.Subscribe, topic) {
+	if !canRead(ac, topic) {
 		jsonErr(w, http.StatusForbidden, "no subscribe permission for topic: "+topic)
 		return
 	}
-	limit := 50
-	if v := r.URL.Query().Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			jsonErr(w, http.StatusBadRequest, "invalid limit")
-			return
-		}
-		limit = min(n, 1000)
-	}
-	sinceStr := ""
-	if v := r.URL.Query().Get("since"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			jsonErr(w, http.StatusBadRequest, "invalid since (want RFC3339): "+err.Error())
-			return
-		}
-		sinceStr = t.UTC().Format(tsFormat)
+	limit, sinceStr, errMsg := parseListParams(r)
+	if errMsg != "" {
+		jsonErr(w, http.StatusBadRequest, errMsg)
+		return
 	}
 	dir := filepath.Join(s.dataDir, "topics", topic)
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
@@ -502,7 +591,7 @@ func (s *server) handleTopics(w http.ResponseWriter, _ *http.Request, _ string, 
 	}
 	topics := []string{}
 	for _, e := range entries {
-		if e.IsDir() && matchACL(ac.Subscribe, e.Name()) {
+		if e.IsDir() && canRead(ac, e.Name()) {
 			topics = append(topics, e.Name())
 		}
 	}
@@ -516,7 +605,7 @@ func (s *server) handleWatch(w http.ResponseWriter, r *http.Request, _ string, a
 		jsonErr(w, http.StatusBadRequest, "invalid topic name")
 		return
 	}
-	if !matchACL(ac.Subscribe, topic) {
+	if !canRead(ac, topic) {
 		jsonErr(w, http.StatusForbidden, "no subscribe permission for topic: "+topic)
 		return
 	}
@@ -576,6 +665,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleDocs)
 	mux.HandleFunc("GET /docs", s.handleDocs)
+	mux.HandleFunc("GET /ui", s.handleUI)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
@@ -584,6 +674,8 @@ func main() {
 	mux.Handle("POST /agents/{name}/inbox", s.auth(s.handleSendDM))
 	mux.Handle("GET /inbox", s.auth(s.handleInbox))
 	mux.Handle("DELETE /inbox/{id}", s.auth(s.handleAck))
+	mux.Handle("GET /history", s.auth(s.handleHistory))
+	mux.Handle("GET /agents/{name}/history", s.auth(s.handleAgentHistory))
 	mux.Handle("GET /topics", s.auth(s.handleTopics))
 	mux.Handle("POST /topics/{topic}", s.auth(s.handlePublish))
 	mux.Handle("GET /topics/{topic}", s.auth(s.handleTopicRead))
@@ -642,6 +734,22 @@ until a message arrives, then returns immediately.
     curl -s -X DELETE -H "Authorization: Bearer $AGENT_BUS_TOKEN" \
       "$AGENT_BUS_URL/inbox/<message-id>"
 
+## Message history
+
+Acked messages are never lost — the server keeps a permanent archive. Read
+your own DM history (sent + received, merged chronologically):
+
+    curl -s -H "Authorization: Bearer $AGENT_BUS_TOKEN" \
+      "$AGENT_BUS_URL/history?limit=100"
+
+Add "?with=<agent>" to see just one conversation; "since" (RFC3339) also
+works. Use this to recover context after a restart.
+
+Agents configured as admin get read-only oversight: GET /agents/<name>/history
+reads any agent's history, and every topic is readable regardless of ACL.
+Admin does not change writing — admins send as themselves like any agent.
+GET /whoami tells you whether you are an admin.
+
 ## Topics (pub/sub)
 
 Topic names: letters, digits, dot, dash, underscore. Topics are created on
@@ -679,4 +787,6 @@ read ("*" and trailing-star prefixes like "build-*" are wildcards).
 
 Be a good citizen: ack promptly, keep bodies under 1 MiB, and put structured
 data in "meta" rather than encoding it into "body".
+
+(Humans: there is a web UI at /ui.)
 `

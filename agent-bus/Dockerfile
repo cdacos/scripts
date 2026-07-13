@@ -4,7 +4,7 @@
 
 FROM golang:1.24-alpine AS build
 WORKDIR /src
-COPY go.mod main.go ./
+COPY go.mod *.go ./
 RUN CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go build -ldflags='-s -w' -o /agent-bus .
 
 FROM scratch

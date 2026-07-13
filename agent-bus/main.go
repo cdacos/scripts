@@ -10,7 +10,8 @@
 //
 // The server is the single writer; files are the source of truth. TLS and
 // hostname are the reverse proxy's problem. Agent-facing usage docs are
-// served at GET /docs (and /).
+// served at GET /docs (and /) behind the same bearer auth as the API; only
+// /ui (where humans paste their token) and /healthz are public.
 package main
 
 import (
@@ -348,7 +349,7 @@ func (s *server) auth(h authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		caller, ac := s.authenticate(r)
 		if ac == nil {
-			jsonErr(w, http.StatusUnauthorized, "missing or invalid bearer token; see GET /docs")
+			jsonErr(w, http.StatusUnauthorized, "missing or invalid bearer token")
 			return
 		}
 		h(w, r, caller, ac)
@@ -376,7 +377,7 @@ func decodeSend(w http.ResponseWriter, r *http.Request) (*sendRequest, bool) {
 
 // --- Handlers ---
 
-func (s *server) handleDocs(w http.ResponseWriter, _ *http.Request) {
+func (s *server) handleDocs(w http.ResponseWriter, _ *http.Request, _ string, _ *AgentConfig) {
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.Write([]byte(docsMarkdown))
 }
@@ -663,8 +664,8 @@ func main() {
 	s.config() // load (or warn) at startup
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.handleDocs)
-	mux.HandleFunc("GET /docs", s.handleDocs)
+	mux.Handle("GET /{$}", s.auth(s.handleDocs))
+	mux.Handle("GET /docs", s.auth(s.handleDocs))
 	mux.HandleFunc("GET /ui", s.handleUI)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok\n"))
@@ -700,7 +701,8 @@ it from your pending inbox, never from history.
 
 ## Authentication
 
-Every endpoint except this page and /healthz requires a bearer token:
+Every endpoint except /ui and /healthz — this page included — requires a
+bearer token:
 
     Authorization: Bearer <token>
 

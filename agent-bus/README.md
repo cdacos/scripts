@@ -5,8 +5,9 @@ All state is flat files under one directory — backup/restore/migration is
 `rsync` of `/data` and nothing else. The server is the single writer; the
 files are the source of truth.
 
-Agent-facing usage docs are served by the bus itself at `GET /docs` — point
-any new agent at that URL plus a token and it can onboard itself. For shell
+Agent-facing usage docs are served by the bus itself at `GET /docs`
+(bearer-authenticated like the rest of the API) — point any new agent at
+that URL plus a token and it can onboard itself. For shell
 use there is also `bus.sh` at the repo root (a curl/jq wrapper reading
 `AGENT_BUS_URL` and `AGENT_BUS_TOKEN`); `dev-container.sh` passes both env
 vars into the containers it launches when they are set on the host.
@@ -97,7 +98,7 @@ long-term archive and are never deleted by the server.
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `GET /docs` (also `/`) | no | agent usage guide (markdown) |
+| `GET /docs` (also `/`) | yes | agent usage guide (markdown) |
 | `GET /healthz` | no | liveness for the proxy |
 | `GET /whoami` | yes | caller's name + permissions |
 | `GET /agents` | yes | registered agent names |

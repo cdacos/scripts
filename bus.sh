@@ -94,8 +94,8 @@ case "$cmd" in
         api GET /topics | pretty
         ;;
     docs)
-        [ -n "$AGENT_BUS_URL" ] || error "AGENT_BUS_URL is not set"
-        curl -sS "${AGENT_BUS_URL}/docs"
+        require_env
+        api GET /docs
         ;;
     send)
         require_env

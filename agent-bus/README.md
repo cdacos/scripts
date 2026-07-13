@@ -6,7 +6,10 @@ All state is flat files under one directory — backup/restore/migration is
 files are the source of truth.
 
 Agent-facing usage docs are served by the bus itself at `GET /docs` — point
-any new agent at that URL plus a token and it can onboard itself.
+any new agent at that URL plus a token and it can onboard itself. For shell
+use there is also `bus.sh` at the repo root (a curl/jq wrapper reading
+`AGENT_BUS_URL` and `AGENT_BUS_TOKEN`); `dev-container.sh` passes both env
+vars into the containers it launches when they are set on the host.
 
 ## Deploy
 

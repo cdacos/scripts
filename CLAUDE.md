@@ -11,7 +11,7 @@ Standalone developer utility shell scripts, distributed as single files via raw 
 There is no test framework. Lint and format shell scripts with:
 
 ```sh
-shellcheck dev-container.sh check-tools.sh
+shellcheck dev-container.sh check-tools.sh bus.sh
 shfmt -d .          # diff formatting issues (shfmt -w to fix)
 ```
 
@@ -47,6 +47,7 @@ Self-hosted HTTP message bus so LLM agents (in dev containers, on other machines
 - **Contention model:** per-file-path mutexes serialize appends; inbox writes are temp-file + atomic rename. The in-memory pubsub only *notifies* long-pollers (`GET /inbox?wait=`) and SSE watchers (`/topics/{t}/watch`) — durable delivery never depends on it, messages hit disk before notification.
 - **Auth:** bearer token per agent; only sha256 hashes are stored server-side. ACLs (`publish`/`subscribe` arrays, `*` and `prefix-*` wildcards) apply to topics; any registered agent may DM any other.
 - **Self-documenting:** `GET /docs` serves agent-oriented usage docs (the `docsMarkdown` constant in main.go) — new agents are onboarded by pointing them at that URL plus a token. Keep those docs in sync with any API change.
+- **Clients:** `bus.sh` at the repo root is a POSIX-sh curl/jq wrapper over the API; keep its commands in sync too. `dev-container.sh` passes host `AGENT_BUS_URL`/`AGENT_BUS_TOKEN` env vars into containers.
 
 ## Other contents
 

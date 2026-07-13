@@ -25,6 +25,9 @@ Environment variables:
   GITCONFIG                 Your ~/.gitconfig content (copied into container)
   GITHUB_TOKEN_DOTFILES     GitHub access token for dotfiles repo (optional)
   GITHUB_USERNAME           GitHub username for dotfiles (optional)
+  AGENT_BUS_URL             agent-bus base URL, passed into container (optional)
+  AGENT_BUS_TOKEN           agent-bus bearer token; identifies the agent, so
+                            export a distinct one per container (optional)
 
 Assumptions:
   - Dockerfile.dev exists at repo root
@@ -171,6 +174,8 @@ start_container() {
         -p "${port}:8000" \
         -e "CLAUDE_CODE_CREDENTIALS=${claude_creds}" \
         -e "CLAUDE_JSON=${claude_json}" \
+        -e "AGENT_BUS_URL=${AGENT_BUS_URL:-}" \
+        -e "AGENT_BUS_TOKEN=${AGENT_BUS_TOKEN:-}" \
         -v "${repo_root}:${repo_root}" \
         -v "${worktree_path}:${worktree_path}" \
         -v "${HOME}/.claude/projects:/home/dev/.claude/projects:rw" \
@@ -541,6 +546,8 @@ USER dev
 # === RUNTIME ENV VARS (available in container) ===
 # CLAUDE_CODE_CREDENTIALS - Claude auth JSON (from Keychain on macOS)
 # CLAUDE_JSON            - Contents of ~/.claude.json (skips onboarding)
+# AGENT_BUS_URL          - agent-bus base URL (if set on host)
+# AGENT_BUS_TOKEN        - agent-bus bearer token (if set on host)
 
 WORKDIR /home/dev
 EOF

@@ -55,6 +55,7 @@ textarea { width:100%; min-height:90px; }
 #topiclist button { display:block; width:100%; text-align:left; margin:4px 0; }
 #topicfeed { max-height:70vh; overflow-y:auto; }
 #login { padding:24px; max-width:600px; margin:0 auto; }
+#docs { white-space:pre-wrap; word-break:break-word; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
 </style>
 </head>
 <body>
@@ -79,6 +80,7 @@ textarea { width:100%; min-height:90px; }
   <button id="nav-history" onclick="showTab('history')">History</button>
   <button id="nav-topics" onclick="showTab('topics')">Topics</button>
   <button id="nav-send" onclick="showTab('send')">Send</button>
+  <button id="nav-docs" onclick="showTab('docs')">Docs</button>
 </nav>
 <main>
   <section id="tab-inbox" class="active">
@@ -121,6 +123,10 @@ textarea { width:100%; min-height:90px; }
     <textarea id="sendbody" placeholder="message body"></textarea>
     <div class="row">meta (optional JSON object) <input id="sendmeta" size="40" placeholder='{"key": "value"}'></div>
     <div class="row"><button class="primary" onclick="doSend()">Send</button> <span id="sendresult" class="muted"></span></div>
+  </section>
+
+  <section id="tab-docs">
+    <pre id="docs" class="muted">loading…</pre>
   </section>
 </main>
 </div>
@@ -169,10 +175,25 @@ async function saveToken() {
 }
 
 function showTab(name) {
-  var tabs = ["inbox", "history", "topics", "send"];
+  var tabs = ["inbox", "history", "topics", "send", "docs"];
   for (var i = 0; i < tabs.length; i++) {
     $("tab-" + tabs[i]).classList.toggle("active", tabs[i] === name);
     $("nav-" + tabs[i]).classList.toggle("active", tabs[i] === name);
+  }
+  if (name === "docs") loadDocs();
+}
+
+var docsLoaded = false;
+async function loadDocs() {
+  if (docsLoaded) return;
+  try {
+    var resp = await fetch("/docs", { headers: authHeaders() });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    $("docs").textContent = await resp.text();
+    $("docs").classList.remove("muted");
+    docsLoaded = true;
+  } catch (e) {
+    $("docs").textContent = "failed to load docs: " + e.message;
   }
 }
 

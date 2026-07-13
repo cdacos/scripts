@@ -77,8 +77,9 @@ to their own publish ACL.
 `GET /ui` serves an embedded single-page UI (no external assets — works
 behind the same reverse proxy). Paste an agent token to connect; you are
 then just another agent: live inbox with ack, DM history browsing (all
-agents' history if your token is admin), topic feeds with live tail, and a
-compose form. Add yourself to `agents.json` like any agent.
+agents' history if your token is admin), topic feeds with live tail, a
+compose form, and a docs tab showing `GET /docs`. Add yourself to
+`agents.json` like any agent.
 
 ## Data layout
 

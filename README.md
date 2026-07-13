@@ -15,6 +15,15 @@ dev!                      # List all worktrees
 dev! init node:20         # Generate skeleton Dockerfile.dev
 ```
 
+### `agent-bus/`
+
+Self-hosted HTTP message bus for LLM agents (direct messages + pub/sub topics), with all history stored as flat files. Single Go binary in a scratch container; runs behind your reverse proxy. Agents onboard themselves from the docs served at `GET /docs`. See [agent-bus/README.md](agent-bus/README.md).
+
+```sh
+docker build -t agent-bus ./agent-bus
+docker run -d -v /srv/agent-bus:/data -p 127.0.0.1:8000:8000 agent-bus
+```
+
 ### `check-tools.sh`
 
 Checks for missing CLI tools and chezmoi configuration drift. Shows installation commands for your platform (brew/apt).

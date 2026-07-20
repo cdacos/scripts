@@ -9,14 +9,14 @@
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="2.6"
+VERSION="2.7"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
 
 show_help() {
 	cat <<'EOF'
-Usage: dev! [name] [folder] [--save|--only] [--keep-alive] [--port H:C] [--docker]
+Usage: dev! [name] [folder] [--save|--only] [--fork] [--keep-alive] [--port H:C] [--docker]
        dev! kill <name>
        dev! completion bash|zsh
        dev! -h | --help
@@ -32,6 +32,7 @@ Commands:
   <name> [folder]          Create/resume container; ask whether to save the folder
   <name> [folder] --save   Add folder to the set, mount the whole set
   <name> [folder] --only   Mount JUST this folder, don't remember it
+  <name> [folder] --fork   Pre-answer yes to the fork+clone prompt (see GitHub fork+clone)
   <name> ... --port H:C     Publish container port C on host port H (repeatable;
                            "--port C" auto-assigns a free host port). Applied on recreate.
   <name> ... --keep-alive  Don't self-suspend; run until stopped (see Idle-suspend)
@@ -62,6 +63,21 @@ Mount set (accumulated folders):
   folder, or --only) takes effect on the next (re)create - a ~1-2s rebuild-free
   docker rm + run; nothing durable is lost.
 
+GitHub fork+clone (isolated agent working copy, opt-in, first create only):
+  If the folder is inside a repo with a github.com origin, dev! ASKS (only on
+  first create; --fork pre-answers yes, --only/--save skip it) whether to give
+  the agent an isolated fork+clone INSTEAD of mounting your live tree. On yes it
+  prompts for the agent's GitHub identity (a bot account you create on github.com
+  + a PAT with repo+workflow scope), forks the repo to that account, clones the
+  fork to <STATE_HOME>/<name>/repo, adds an 'upstream' remote, and checks out a
+  branch named after the container. ONLY that clone is mounted - your live tree is
+  untouched and never exposed. Inside, the agent commits and runs:
+      git push -u origin <name> && gh pr create --repo <owner>/<repo> --fill
+  to open a PR from its fork. Identity (GITHUB_AGENT_USER/TOKEN/EMAIL) lives in
+  <name>/.env and drives git/gh at runtime. `kill` deletes the local clone; the
+  GitHub fork is left intact. Repos with no GitHub origin fall through to a normal
+  mount.
+
 Start semantics:
   running   -> if the mount set is unchanged, report and quit; otherwise offer to
                recreate to apply the change (attach: docker exec -it -u <user> dev-<name> bash)
@@ -73,7 +89,8 @@ Start semantics:
 State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
   <STATE_HOME>/.env          shared KEY=value env (AGENT_BUS_URL, GITHUB_USERNAME,
                              GITHUB_TOKEN_DOTFILES, GITCONFIG, ...) - loaded first
-  <STATE_HOME>/<name>/.env   per-name KEY=value (AGENT_BUS_TOKEN + overrides) - wins
+  <STATE_HOME>/<name>/.env   per-name KEY=value (AGENT_BUS_TOKEN, GITHUB_AGENT_*
+                             for a fork clone, + overrides) - wins
   <STATE_HOME>/<name>/Dockerfile  per-name build recipe (default on first create;
                              bind-mounted rw at ~/Dockerfile so the container
                              can edit it - takes effect on the next recreate)
@@ -81,6 +98,8 @@ State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
                              <host>:8000; deliberately NOT in .env)
   <STATE_HOME>/<name>/mounts saved folders, one symlink each (name = abs path with
                              '/' as backtick, target = the folder). rm one to forget it.
+  <STATE_HOME>/<name>/repo   isolated fork clone (present only with --fork); the
+                             sole mounted working copy, origin=fork upstream=orig
   <STATE_HOME>/<name>/folder last folder path (working-dir hint / legacy fallback)
   <STATE_HOME>/<name>/fullname  the login user's GECOS display name (asked on create)
   <STATE_HOME>/<name>/keep-alive  marker: present => opt out of idle-suspend (rm to revert)
@@ -331,8 +350,10 @@ migrate_legacy_folder() {
 	fi
 }
 
-# Sorted list of a running container's folder-mount sources (excludes the
-# container's own claude dir / Dockerfile under name_dir, and docker.sock).
+# Sorted list of a running container's folder-mount sources. Excludes the
+# container's own internal mounts (claude dir + Dockerfile under name_dir) and
+# docker.sock, but KEEPS a fork clone at <name_dir>/repo - it is a real folder
+# mount, so it must stay in the diff or resume would recreate on every run.
 current_folder_mounts() {
 	cfm_container="$1"
 	cfm_name_dir="$2"
@@ -340,7 +361,7 @@ current_folder_mounts() {
 		while IFS= read -r src; do
 			[ -n "$src" ] || continue
 			case "$src" in
-			"$cfm_name_dir"/*) continue ;;
+			"$cfm_name_dir"/claude | "$cfm_name_dir"/Dockerfile) continue ;;
 			/var/run/docker.sock) continue ;;
 			*) echo "$src" ;;
 			esac
@@ -508,6 +529,139 @@ warn_git() {
 	fi
 }
 
+# --- GitHub fork+clone (isolated per-agent working copy) -----------------------
+# Instead of mounting a live repo (agent edits your working tree), an agent can
+# get a self-contained clone of its OWN GitHub fork under <name>/repo - the only
+# thing mounted. It commits there and opens a PR from the fork. See ensure_/setup_.
+
+# Echo the GitHub "owner/repo" for a folder's origin remote, or return 1. Handles
+# ssh (git@github.com:owner/repo.git), https, and scp-less URL forms; strips .git.
+github_remote() {
+	gr_url=$(git -C "$1" remote get-url origin 2>/dev/null) || return 1
+	case "$gr_url" in
+	*github.com*) ;;
+	*) return 1 ;;
+	esac
+	# Drop scheme/host/user, keep the "owner/repo" path, strip a trailing .git.
+	gr_path=$(printf '%s' "$gr_url" | sed -E 's#^[a-z]+://##; s#^[^/@]*@##; s#^github\.com[:/]##; s#\.git$##')
+	case "$gr_path" in
+	*/*) printf '%s' "$gr_path" ;;
+	*) return 1 ;;
+	esac
+}
+
+# Prompt for and persist the agent's GitHub identity (username + PAT + email) if
+# <name>/.env lacks a non-empty GITHUB_AGENT_TOKEN. Modeled on ensure_token. The
+# token is validated against the real account; a mismatch is a warning, not fatal.
+ensure_github_identity() {
+	name="$1"
+	name_dir="$2"
+	name_env="$3"
+
+	if [ -f "$name_env" ] && grep -qE '^GITHUB_AGENT_TOKEN=.+' "$name_env"; then
+		return 0
+	fi
+
+	printf "\n"
+	printf "${CYAN}GitHub identity for agent '%s'.${NC}\n" "$name"
+	printf "Create a bot account on github.com first, then a Personal Access Token\n"
+	printf "with repo + workflow scope (classic) or contents/PR/fork write (fine-grained).\n"
+	printf "GitHub username (blank to skip): "
+	read -r gh_user
+	if [ -z "$gh_user" ]; then
+		info "Skipping GitHub identity."
+		return 1
+	fi
+	printf "Personal Access Token: "
+	read -r gh_token
+	if [ -z "$gh_token" ]; then
+		info "Empty token, skipping GitHub identity."
+		return 1
+	fi
+	printf "Commit email [%s@users.noreply.github.com]: " "$gh_user"
+	read -r gh_email
+	[ -z "$gh_email" ] && gh_email="$gh_user@users.noreply.github.com"
+
+	# Validate the token maps to the given account (best-effort; warn on mismatch).
+	if command -v gh >/dev/null 2>&1; then
+		actual=$(GH_TOKEN="$gh_token" gh api user --jq .login 2>/dev/null) || actual=""
+		if [ -z "$actual" ]; then
+			printf "${YELLOW}Warning: could not validate the token with 'gh api user' - continuing anyway.${NC}\n" >&2
+		elif [ "$actual" != "$gh_user" ]; then
+			printf "${YELLOW}Warning: token belongs to '%s', not '%s'. Using the token's account.${NC}\n" "$actual" "$gh_user" >&2
+			gh_user="$actual"
+		fi
+	fi
+
+	mkdir -p "$name_dir"
+	if [ ! -f "$name_env" ]; then
+		cat >"$name_env" <<EOF
+# Per-name dev-container env. Plain KEY=value only (no quotes, no \$expansion).
+# Overrides the shared $STATE_HOME/.env.
+EOF
+	fi
+	{
+		printf 'GITHUB_AGENT_USER=%s\n' "$gh_user"
+		printf 'GITHUB_AGENT_TOKEN=%s\n' "$gh_token"
+		printf 'GITHUB_AGENT_EMAIL=%s\n' "$gh_email"
+	} >>"$name_env"
+	export GITHUB_AGENT_USER="$gh_user" GITHUB_AGENT_TOKEN="$gh_token" GITHUB_AGENT_EMAIL="$gh_email"
+	success "GitHub identity for '$gh_user' written to $name_env"
+	return 0
+}
+
+# Fork <upstream> to the agent's account, clone the fork into <name>/repo, add an
+# 'upstream' remote, and create the working branch (= container name). Uses the
+# agent's token (GITHUB_AGENT_TOKEN) for all operations. Idempotent: if the clone
+# dir already exists it is left as-is. Echoes the clone path on success; returns 1
+# on any failure so the caller can fall back to a normal folder mount.
+setup_github_clone() {
+	name="$1"
+	name_dir="$2"
+	upstream="$3"
+	clone_dir="$name_dir/repo"
+
+	if [ -d "$clone_dir" ]; then
+		printf '%s' "$clone_dir"
+		return 0
+	fi
+	command -v gh >/dev/null 2>&1 || {
+		printf "${YELLOW}Warning: 'gh' not found on host; cannot set up the fork. Falling back to a normal mount.${NC}\n" >&2
+		return 1
+	}
+	[ -n "${GITHUB_AGENT_TOKEN:-}" ] || return 1
+
+	repo_name=${upstream#*/}
+
+	info "Forking $upstream to the agent's account..." >&2
+	GH_TOKEN="$GITHUB_AGENT_TOKEN" gh repo fork "$upstream" --clone=false --remote=false >&2 2>&1 || {
+		printf "${YELLOW}Warning: 'gh repo fork' failed. Falling back to a normal mount.${NC}\n" >&2
+		return 1
+	}
+
+	fork="$GITHUB_AGENT_USER/$repo_name"
+	info "Cloning fork $fork into $clone_dir..." >&2
+	# A freshly created fork can take a moment to become clonable - retry briefly.
+	i=0
+	while [ "$i" -lt 5 ]; do
+		if GH_TOKEN="$GITHUB_AGENT_TOKEN" gh repo clone "$fork" "$clone_dir" >&2 2>&1; then
+			break
+		fi
+		i=$((i + 1))
+		[ "$i" -lt 5 ] && sleep 3
+	done
+	if [ ! -d "$clone_dir/.git" ]; then
+		printf "${YELLOW}Warning: could not clone the fork after retries. Falling back to a normal mount.${NC}\n" >&2
+		rm -rf "$clone_dir"
+		return 1
+	fi
+
+	git -C "$clone_dir" remote add upstream "https://github.com/$upstream.git" 2>/dev/null || true
+	git -C "$clone_dir" checkout -b "$name" >&2 2>&1 || true
+	printf '%s' "$clone_dir"
+	return 0
+}
+
 # Seed a fresh per-name claude dir from host ~/.claude (settings/skills/plugins only).
 seed_claude() {
 	claude_dir="$1"
@@ -541,13 +695,15 @@ folder
 fullname
 claude
 mounts
+repo
 .build-sig
 EOF
 		return 0
 	fi
 	# Upgrade older ignore files (mounts/ can contain symlinks to large host
-	# folders; .build-sig is the build cache marker - neither belongs in context).
-	for entry in mounts .build-sig fullname; do
+	# folders; repo/ is a fork clone; .build-sig is the build cache marker - none
+	# of these belong in the build context).
+	for entry in mounts repo .build-sig fullname; do
 		grep -qxF "$entry" "$di" || printf '%s\n' "$entry" >>"$di"
 	done
 }
@@ -929,7 +1085,8 @@ prompt_mode() {
 }
 
 # Create, resume, or start a container. mode is "save"/"only"/"" (prompt if it
-# matters); keep_alive is "true" (opt out of idle-suspend) or "".
+# matters); keep_alive is "true" (opt out of idle-suspend) or ""; want_fork is
+# "true" (pre-answer the fork prompt yes) or "".
 cmd_up() {
 	name=$(slugify "$1")
 	folder_arg="${2:-.}"
@@ -937,6 +1094,7 @@ cmd_up() {
 	mode="$4"
 	keep_alive="$5"
 	port_specs="$6"
+	want_fork="$7"
 	[ -n "$name" ] || error "Invalid name"
 
 	container="dev-$name"
@@ -952,9 +1110,35 @@ cmd_up() {
 	folder=$(resolve_folder "$folder_arg")
 	migrate_legacy_folder "$name_dir"
 
+	status=$(get_container_status "$container")
+	first_create=false
+	[ "$status" = "none" ] && first_create=true
+
+	# Fork decision (strictly opt-in, first create only): when the folder is inside
+	# a GitHub repo, offer an isolated fork+clone instead of mounting the live tree.
+	# Offered only when no mode flag was given (the ambiguous case) or --fork was
+	# passed; only an explicit yes enables it. Everything else falls through to a
+	# normal folder mount. The clone becomes the sole mounted working copy.
+	use_fork=false
+	gh_upstream=""
+	if [ "$first_create" = true ] && { [ "$want_fork" = true ] || [ -z "$mode" ]; } &&
+		gh_upstream=$(github_remote "$folder"); then
+		if [ "$want_fork" = true ]; then
+			use_fork=true
+		else
+			printf "\n"
+			printf "${CYAN}%s is a GitHub repo (%s).${NC}\n" "$folder" "$gh_upstream"
+			printf "Create an isolated fork+clone for this agent instead of mounting it directly? [y/n] "
+			read -r fork_ans
+			case "$fork_ans" in [Yy] | [Yy][Ee][Ss]) use_fork=true ;; esac
+		fi
+	fi
+	[ "$use_fork" = true ] && mode=save
+
 	# Resolve the mode. If no flag: an already-saved folder needs no decision
-	# (just start the set); anything else is ambiguous, so ask.
-	if [ -z "$mode" ]; then
+	# (just start the set); anything else is ambiguous, so ask. Skipped when
+	# forking (the clone is force-saved above).
+	if [ "$use_fork" = false ] && [ -z "$mode" ]; then
 		if [ -L "$mounts_dir/$(encode_path "$folder")" ]; then
 			mode=save
 		else
@@ -973,10 +1157,6 @@ cmd_up() {
 	load_env_files "$shared_env" "$name_env"
 	# shellcheck disable=SC2086
 	desired_ports=$(build_desired_ports "$name_dir" $port_specs)
-
-	status=$(get_container_status "$container")
-	first_create=false
-	[ "$status" = "none" ] && first_create=true
 
 	# Running: compare the running mount set to what this invocation wants. Same ->
 	# just report. Different -> the change (a newly saved folder, or --only) needs a
@@ -1040,7 +1220,11 @@ cmd_up() {
 		info "Will create:"
 		printf "  Name:       ${YELLOW}%s${NC}\n" "$name"
 		printf "  User:       ${YELLOW}%s${NC} (home /home/%s; full name asked below)\n" "$(container_username "$name")" "$(container_username "$name")"
-		if [ "$mode" = only ]; then
+		if [ "$use_fork" = true ]; then
+			printf "  Repo:       ${YELLOW}%s${NC} (GitHub)\n" "$gh_upstream"
+			printf "  Fork clone: ${YELLOW}%s/repo${NC} (fork to the agent, clone here, branch '%s')\n" "$name_dir" "$name"
+			printf "              ${CYAN}isolated: only the clone is mounted, not %s${NC}\n" "$folder"
+		elif [ "$mode" = only ]; then
 			printf "  Folder:     ${YELLOW}%s${NC} (only - not saved)\n" "$folder"
 		else
 			printf "  Folder:     ${YELLOW}%s${NC} (saved to the set)\n" "$folder"
@@ -1070,6 +1254,23 @@ cmd_up() {
 	fi
 
 	mkdir -p "$name_dir"
+
+	# Set up the isolated fork clone now (past the confirm gate). On success the
+	# clone replaces the host folder as the mounted working copy (mode is already
+	# 'save', so it joins the set); on any failure fall back to mounting the folder
+	# directly - still with mode=save, so the container is never left with no mount.
+	if [ "$use_fork" = true ]; then
+		if ensure_github_identity "$name" "$name_dir" "$name_env" &&
+			clone=$(setup_github_clone "$name" "$name_dir" "$gh_upstream"); then
+			load_env_files "$shared_env" "$name_env"
+			folder="$clone"
+			success "Fork clone ready: $clone"
+		else
+			use_fork=false
+			printf "${YELLOW}Fork setup skipped; mounting %s directly instead.${NC}\n" "$folder" >&2
+		fi
+	fi
+
 	printf '%s\n' "$desired_ports" >"$name_dir/ports"
 	printf '%s' "$folder" >"$name_dir/folder"
 	[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
@@ -1099,6 +1300,10 @@ cmd_up() {
 	printf "\n"
 	success "Container ready!"
 	printf "Ports ${YELLOW}%s${NC}\n" "$(format_ports "$desired_ports")"
+	if [ "$use_fork" = true ]; then
+		printf "${CYAN}Isolated fork clone at %s (origin=your fork, upstream=%s, branch '%s').${NC}\n" "$folder" "$gh_upstream" "$name"
+		printf "${CYAN}Inside: commit, 'git push -u origin %s', then 'gh pr create --repo %s --fill'.${NC}\n" "$name" "$gh_upstream"
+	fi
 	if [ "$keep_alive" != "true" ]; then
 		printf "${CYAN}Idle-suspend on: exit every shell and it stops in ~%ss. Resume with 'dev! %s'.${NC}\n" "${DEV_SUSPEND_IDLE:-20}" "$name"
 	fi
@@ -1192,10 +1397,13 @@ cmd_kill() {
 	esac
 
 	docker rmi "dev-$name" >/dev/null 2>&1 || true
+	had_fork=false
+	[ -d "$name_dir/repo" ] && had_fork=true
 	[ -d "$name_dir" ] && rm -rf "$name_dir"
 
 	printf "\n"
 	success "Killed '$name' (port $port)"
+	[ "$had_fork" = true ] && info "The GitHub fork on the agent's account was left intact."
 }
 
 # Write the batteries-included default Dockerfile to $1. Alpine-based: bash/git/curl,
@@ -1220,6 +1428,7 @@ RUN apk add --no-cache \
     ripgrep \
     jq \
     docker-cli \
+    github-cli \
     tmux \
     vim
 
@@ -1277,6 +1486,20 @@ RUN mkdir -p /home/${DEV_USER}/.local/bin
 RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc \
     && echo "alias claude!='claude --dangerously-skip-permissions --thinking-display summarized'" >> ~/.bashrc \
     && echo "alias ll='ls -la'" >> ~/.bashrc
+
+# Agent GitHub identity: when a per-agent PAT is injected at runtime (env vars
+# GITHUB_AGENT_USER/TOKEN/EMAIL, set by dev!'s fork+clone flow via --env-file),
+# wire up gh + git so 'git push' and 'gh pr create' act as the agent. The
+# credential helper is stored single-quoted, so $GITHUB_AGENT_TOKEN is expanded by
+# git at push time (from the env), never written to disk. A no-op without a token.
+RUN <<'BASHRC' cat >> ~/.bashrc
+if [ -n "$GITHUB_AGENT_TOKEN" ]; then
+  export GH_TOKEN="$GITHUB_AGENT_TOKEN"
+  git config --global credential.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_AGENT_TOKEN"; }; f'
+  [ -n "$GITHUB_AGENT_USER" ] && git config --global user.name "$GITHUB_AGENT_USER"
+  [ -n "$GITHUB_AGENT_EMAIL" ] && git config --global user.email "$GITHUB_AGENT_EMAIL"
+fi
+BASHRC
 
 # Claude Code (native installer, installs to ~/.local/bin)
 RUN curl -fsSL https://claude.ai/install.sh | bash
@@ -1388,10 +1611,12 @@ main() {
 		mode=""
 		keep_alive=""
 		port_specs=""
+		want_fork=""
 		while [ $# -gt 0 ]; do
 			case "$1" in
 			--docker) docker_sock=true ;;
 			--keep-alive) keep_alive=true ;;
+			--fork) want_fork=true ;;
 			--save)
 				[ -n "$mode" ] && error "--save and --only are mutually exclusive"
 				mode=save
@@ -1411,7 +1636,7 @@ main() {
 			esac
 			shift
 		done
-		cmd_up "$name" "$folder_arg" "$docker_sock" "$mode" "$keep_alive" "$port_specs"
+		cmd_up "$name" "$folder_arg" "$docker_sock" "$mode" "$keep_alive" "$port_specs" "$want_fork"
 		;;
 	esac
 }

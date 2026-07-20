@@ -25,9 +25,14 @@ Environment variables:
   GITCONFIG                 Your ~/.gitconfig content (copied into container)
   GITHUB_TOKEN_DOTFILES     GitHub access token for dotfiles repo (optional)
   GITHUB_USERNAME           GitHub username for dotfiles (optional)
-  AGENT_BUS_URL             agent-bus base URL, passed into container (optional)
-  AGENT_BUS_TOKEN           agent-bus bearer token; identifies the agent, so
-                            export a distinct one per container (optional)
+  AGENT_BUS_URL             agent-bus base URL; seeds new containers (optional)
+  AGENT_BUS_TOKEN           agent-bus bearer token; seeds new containers (optional)
+
+  On first launch these seed a per-container file at
+  ../{repo}.worktrees/{port}/.agent-bus.env (outside the git checkout). The
+  container reads its bus identity from that file via --env-file, so give each
+  container a DISTINCT AGENT_BUS_TOKEN by editing the file, then recreate it
+  (dev! kill <branch> && dev! <branch>).
 
 Assumptions:
   - Dockerfile.dev exists at repo root
@@ -128,6 +133,33 @@ get_container_status() {
     fi
 }
 
+# Path to the per-container agent-bus env file.
+# Lives in the PORT dir (sibling to the branch checkout), so it is outside any
+# git worktree and never shows up in `git status`.
+get_bus_env_file() {
+    port_dir="$1"
+    echo "${port_dir}/.agent-bus.env"
+}
+
+# Ensure the per-container agent-bus env file exists. On first creation it is
+# seeded from the host environment (so existing single-agent setups keep working);
+# edit AGENT_BUS_TOKEN in the file to give each container a distinct bus identity.
+ensure_bus_env_file() {
+    bus_env_file="$1"
+    if [ ! -f "$bus_env_file" ]; then
+        mkdir -p "$(dirname "$bus_env_file")"
+        cat > "$bus_env_file" <<EOF
+# Per-container agent-bus identity, read by dev! via 'docker run --env-file'.
+# AGENT_BUS_URL is shared across agents; AGENT_BUS_TOKEN MUST be distinct per
+# container (it identifies the agent on the bus). Seeded from the host env below;
+# paste the operator-issued token for this container, then recreate it
+# (dev! kill <branch> && dev! <branch>) so the new value is baked into the container.
+AGENT_BUS_URL=${AGENT_BUS_URL:-}
+AGENT_BUS_TOKEN=${AGENT_BUS_TOKEN:-}
+EOF
+    fi
+}
+
 # Build Docker image
 build_image() {
     image_name="$1"
@@ -164,18 +196,20 @@ start_container() {
     worktree_path="$3"
     image_name="$4"
     repo_root="$5"
+    bus_env_file="$6"
 
     claude_creds=$(get_claude_credentials)
     claude_json=$(get_claude_json)
 
+    # Agent-bus identity comes from the per-container env file (see ensure_bus_env_file),
+    # NOT the host env, so each container can carry a distinct AGENT_BUS_TOKEN.
     info "Starting container '$container_name'..."
     docker run --init -d \
         --name "$container_name" \
         -p "${port}:8000" \
         -e "CLAUDE_CODE_CREDENTIALS=${claude_creds}" \
         -e "CLAUDE_JSON=${claude_json}" \
-        -e "AGENT_BUS_URL=${AGENT_BUS_URL:-}" \
-        -e "AGENT_BUS_TOKEN=${AGENT_BUS_TOKEN:-}" \
+        --env-file "$bus_env_file" \
         -v "${repo_root}:${repo_root}" \
         -v "${worktree_path}:${worktree_path}" \
         -v "${HOME}/.claude/projects:/home/dev/.claude/projects:rw" \
@@ -373,12 +407,16 @@ cmd_create() {
         done
     fi
 
+    bus_env_file=$(get_bus_env_file "$worktrees_dir/$port")
+    ensure_bus_env_file "$bus_env_file"
+
     build_image "$image_name" "$repo_root" "$mount_path"
-    start_container "$container_name" "$port" "$mount_path" "$image_name" "$repo_root"
+    start_container "$container_name" "$port" "$mount_path" "$image_name" "$repo_root" "$bus_env_file"
 
     printf "\n"
     success "Container ready!"
     printf "Port ${YELLOW}%s${NC} → container:8000\n" "$port"
+    printf "Agent-bus env: ${CYAN}%s${NC} (set a ${YELLOW}distinct${NC} AGENT_BUS_TOKEN, then recreate)\n" "$bus_env_file"
     if [ "$local_mode" != "true" ]; then
         printf "If your container's git is older than 2.48, run: ${CYAN}git config --unset extensions.relativeWorktrees${NC}\n"
     fi
@@ -411,8 +449,10 @@ cmd_run() {
 
     case "$status" in
         none)
+            bus_env_file=$(get_bus_env_file "$port_dir")
+            ensure_bus_env_file "$bus_env_file"
             build_image "$image_name" "$repo_root" "$mount_path"
-            start_container "$container_name" "$port" "$mount_path" "$image_name" "$repo_root"
+            start_container "$container_name" "$port" "$mount_path" "$image_name" "$repo_root" "$bus_env_file"
             ;;
         stopped)
             info "Starting stopped container '$container_name'..."
@@ -485,6 +525,10 @@ cmd_kill() {
         info "Removing git worktree..."
         git -C "$repo_root" worktree remove --force "$worktree_path"
     fi
+
+    # Remove the per-container agent-bus env file (token is tied to this container)
+    bus_env_file=$(get_bus_env_file "$port_dir")
+    [ -f "$bus_env_file" ] && rm -f "$bus_env_file"
 
     # Remove port directory if empty
     if [ -d "$port_dir" ] && [ -z "$(ls -A "$port_dir")" ]; then

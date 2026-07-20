@@ -2,21 +2,21 @@
 # dev! - Folder-based Docker dev container launcher
 #
 # Each named container mounts ONE folder (rw) plus its own persistent state under
-# ~/.local/dev-container/<name>/ (bus token, claude home, port, folder). Nothing
+# ~/.local/dev-container/<name>/ (bus token, claude home, ports, folder). Nothing
 # else on the host is exposed. No git worktrees, no repo bind-mount, no docker.sock
 # (unless --docker is passed).
 
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="2.5"
+VERSION="2.6"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
 
 show_help() {
 	cat <<'EOF'
-Usage: dev! [name] [folder] [--save|--only] [--keep-alive] [--docker]
+Usage: dev! [name] [folder] [--save|--only] [--keep-alive] [--port H:C] [--docker]
        dev! kill <name>
        dev! completion bash|zsh
        dev! -h | --help
@@ -32,6 +32,8 @@ Commands:
   <name> [folder]          Create/resume container; ask whether to save the folder
   <name> [folder] --save   Add folder to the set, mount the whole set
   <name> [folder] --only   Mount JUST this folder, don't remember it
+  <name> ... --port H:C     Publish container port C on host port H (repeatable;
+                           "--port C" auto-assigns a free host port). Applied on recreate.
   <name> ... --keep-alive  Don't self-suspend; run until stopped (see Idle-suspend)
   <name> ... --docker      Also mount /var/run/docker.sock (see Isolation below)
   kill <name>              Stop+remove container and image, delete its state dir
@@ -75,7 +77,8 @@ State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
   <STATE_HOME>/<name>/Dockerfile  per-name build recipe (default on first create;
                              bind-mounted rw at ~/Dockerfile so the container
                              can edit it - takes effect on the next recreate)
-  <STATE_HOME>/<name>/port   host port (plain text; deliberately NOT in .env)
+  <STATE_HOME>/<name>/ports  host:container port pairs, one per line (the primary is
+                             <host>:8000; deliberately NOT in .env)
   <STATE_HOME>/<name>/mounts saved folders, one symlink each (name = abs path with
                              '/' as backtick, target = the folder). rm one to forget it.
   <STATE_HOME>/<name>/folder last folder path (working-dir hint / legacy fallback)
@@ -137,6 +140,7 @@ Examples:
   dev! api ~/src/api --save   # remember ~/src/api and mount the set
   dev! api ~/src/lib --save   # now mounts BOTH ~/src/api and ~/src/lib
   dev! api ~/scratch --only   # mount just ~/scratch this run, remember nothing
+  dev! api . --port 5173      # also publish container :5173 on an auto-assigned host port
   dev! scratch                # current dir; asks whether to save it
   dev! ci . --save --docker   # save current dir + mount docker.sock
   dev!                        # list all containers
@@ -372,41 +376,118 @@ EOF
 	fi
 }
 
-# Echo the port for a name: stored port if present, else max existing +1, else prompt.
-# Prompt/info go to stderr so the caller can capture the port from stdout.
-allocate_port() {
-	name_dir="$1"
-	if [ -f "$name_dir/port" ]; then
-		cat "$name_dir/port"
-		return 0
-	fi
+# --- Port set (host:container mappings) ----------------------------------------
+# A container's published ports live in <name>/ports, one HOST:CONTAINER pair per
+# line (docker's own -p order); the primary web port is <host>:8000. Host ports are
+# globally unique across all containers, and the next free one is derived by scanning
+# every ports file (no stored counter), so hand-edits and kills self-heal.
 
-	max_port=""
-	has_ports=false
-	for pf in "$STATE_HOME"/*/port; do
+# Every host port claimed across all containers (left side of each pair), one per line.
+used_host_ports() {
+	for pf in "$STATE_HOME"/*/ports; do
 		[ -f "$pf" ] || continue
-		has_ports=true
-		p=$(cat "$pf")
-		if [ -z "$max_port" ] || { [ "$p" -gt "$max_port" ] 2>/dev/null; }; then
-			max_port="$p"
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			printf '%s\n' "${line%%:*}"
+		done <"$pf"
+	done
+}
+
+# Prompt (stderr) for the very first host port when no container owns one yet.
+# Echoes the validated port to stdout.
+prompt_starting_port() {
+	printf "\n" >&2
+	printf "${CYAN}No existing port assignments found.${NC}\n" >&2
+	printf "Enter starting port number (e.g., 9000, 10000, 15000): " >&2
+	read -r start_port
+	if ! echo "$start_port" | grep -qE '^[0-9]+$'; then
+		error "Invalid port number. Please enter a numeric value."
+	fi
+	if [ "$start_port" -lt 1024 ] || [ "$start_port" -gt 65535 ]; then
+		error "Port must be between 1024 and 65535"
+	fi
+	echo "$start_port"
+}
+
+# Next free host port: 1 + max(all claimed host ports UNION the reserved list in $1),
+# or a prompted starting port when nothing is claimed anywhere yet. $1 is a
+# newline/space list of in-flight host ports not yet on disk, so one run can assign
+# several without collisions.
+next_host_port() {
+	max=""
+	# shellcheck disable=SC2046,SC2086
+	for p in $(used_host_ports) $1; do
+		[ -n "$p" ] || continue
+		if [ -z "$max" ] || { [ "$p" -gt "$max" ] 2>/dev/null; }; then
+			max="$p"
 		fi
 	done
-
-	if [ "$has_ports" = false ]; then
-		printf "\n" >&2
-		printf "${CYAN}No existing port assignments found.${NC}\n" >&2
-		printf "Enter starting port number (e.g., 9000, 10000, 15000): " >&2
-		read -r start_port
-		if ! echo "$start_port" | grep -qE '^[0-9]+$'; then
-			error "Invalid port number. Please enter a numeric value."
-		fi
-		if [ "$start_port" -lt 1024 ] || [ "$start_port" -gt 65535 ]; then
-			error "Port must be between 1024 and 65535"
-		fi
-		echo "$start_port"
+	if [ -z "$max" ]; then
+		prompt_starting_port
 	else
-		echo $((max_port + 1))
+		echo $((max + 1))
 	fi
+}
+
+# Build the desired HOST:CONTAINER set (newline pairs) for a container: its existing
+# ports file (or a freshly allocated <host>:8000 primary on first create) plus any
+# `--port` specs passed as extra args. A spec is "C" (auto-assign the host port) or
+# "H:C" (explicit host port). A spec whose container port is already mapped is
+# ignored; an explicit host-port clash is an error. Echoes the set; primary stays first.
+build_desired_ports() {
+	bp_dir="$1"
+	shift
+	if [ -s "$bp_dir/ports" ]; then
+		desired=$(grep -v '^[[:space:]]*$' "$bp_dir/ports")
+	else
+		desired="$(next_host_port "")":8000
+	fi
+	for spec in "$@"; do
+		[ -n "$spec" ] || continue
+		case "$spec" in
+		*:*)
+			hport="${spec%%:*}"
+			cport="${spec#*:}"
+			;;
+		*)
+			hport=""
+			cport="$spec"
+			;;
+		esac
+		echo "$cport" | grep -qE '^[0-9]+$' || error "Invalid --port container port: $spec"
+		printf '%s\n' "$desired" | grep -q ":${cport}\$" && continue
+		if [ -n "$hport" ]; then
+			echo "$hport" | grep -qE '^[0-9]+$' || error "Invalid --port host port: $spec"
+			printf '%s\n' "$desired" | grep -q "^${hport}:" &&
+				error "Host port $hport is already mapped for this container"
+		else
+			hport=$(next_host_port "$(printf '%s\n' "$desired" | cut -d: -f1)")
+		fi
+		desired="$desired
+$hport:$cport"
+	done
+	printf '%s\n' "$desired"
+}
+
+# The primary host port (the pair whose container side is 8000, else the first pair)
+# from a newline list of HOST:CONTAINER pairs. Empty when the list is empty.
+primary_host_port() {
+	printf '%s\n' "$1" | awk -F: '
+		NF { if (!seen) { first = $1; seen = 1 }
+		     if ($2 == 8000) { print $1; found = 1; exit } }
+		END { if (!found && seen) print first }'
+}
+
+# Format a newline pair list as "H->C, H->C" for display.
+format_ports() {
+	printf '%s\n' "$1" | awk -F: 'NF { printf "%s%s->%s", sep, $1, $2; sep = ", " } END { print "" }'
+}
+
+# A running container's actual published bindings as sorted HOST:CONTAINER pairs
+# (tcp), to diff against the desired set when deciding whether to recreate.
+current_port_bindings() {
+	docker inspect -f '{{range $p, $c := .HostConfig.PortBindings}}{{(index $c 0).HostPort}}:{{$p}}{{"\n"}}{{end}}' "$1" 2>/dev/null |
+		sed 's|/tcp||' | grep -v '^$' | sort -u
 }
 
 # Resolve a folder argument to an absolute path (must exist). stdout = path only.
@@ -455,7 +536,7 @@ ensure_dockerignore() {
 # Auto-generated by dev!. Keeps the build context small and secret-free.
 # The Dockerfile lives in this dir alongside container state; ignore the state.
 .env
-port
+ports
 folder
 fullname
 claude
@@ -750,11 +831,12 @@ done
 
 # Run the container. env files are added only if present (docker errors on a
 # missing one). Every folder in mount_list (newline-separated) is bind-mounted at
-# the same absolute path; cwd is this invocation's folder. keep_alive=true swaps
-# the self-suspend supervisor for a plain never-exit daemon.
+# the same absolute path; every pair in port_list (newline HOST:CONTAINER) is
+# published; cwd is this invocation's folder. keep_alive=true swaps the self-suspend
+# supervisor for a plain never-exit daemon.
 run_container() {
 	name="$1"
-	port="$2"
+	port_list="$2"
 	cwd="$3"
 	image="$4"
 	claude_dir="$5"
@@ -771,9 +853,17 @@ run_container() {
 
 	set -- --init -d \
 		--name "dev-$name" \
-		-p "${port}:8000" \
 		-e "CLAUDE_CODE_CREDENTIALS=${claude_creds}" \
 		-e "CLAUDE_JSON=${claude_json}"
+
+	oldifs=$IFS
+	IFS='
+'
+	for p in $port_list; do
+		[ -n "$p" ] || continue
+		set -- "$@" -p "$p"
+	done
+	IFS=$oldifs
 
 	[ -f "$shared_env" ] && set -- "$@" --env-file "$shared_env"
 	[ -f "$name_env" ] && set -- "$@" --env-file "$name_env"
@@ -846,6 +936,7 @@ cmd_up() {
 	docker_sock="$3"
 	mode="$4"
 	keep_alive="$5"
+	port_specs="$6"
 	[ -n "$name" ] || error "Invalid name"
 
 	container="dev-$name"
@@ -880,7 +971,8 @@ cmd_up() {
 
 	ensure_shared_env
 	load_env_files "$shared_env" "$name_env"
-	port=$(allocate_port "$name_dir")
+	# shellcheck disable=SC2086
+	desired_ports=$(build_desired_ports "$name_dir" $port_specs)
 
 	status=$(get_container_status "$container")
 	first_create=false
@@ -893,15 +985,18 @@ cmd_up() {
 		[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
 		desired=$(build_mount_list "$mode" "$folder" "$mounts_dir" 2>/dev/null | sort -u)
 		current=$(current_folder_mounts "$container" "$name_dir")
-		if [ "$desired" = "$current" ]; then
+		desired_p=$(printf '%s\n' "$desired_ports" | sort -u)
+		current_p=$(current_port_bindings "$container")
+		if [ "$desired" = "$current" ] && [ "$desired_p" = "$current_p" ]; then
 			info "Container '$container' is already running."
-			printf "Port ${YELLOW}%s${NC} → container:8000\n" "$(cat "$name_dir/port" 2>/dev/null || echo '?')"
+			printf "Ports ${YELLOW}%s${NC}\n" "$(format_ports "$desired_ports")"
 			printf "Attach with: ${CYAN}docker exec -it -u %s %s bash${NC}\n" "$(resolve_username "$dockerfile" "$name")" "$container"
 			exit 0
 		fi
 		printf "\n"
-		info "Mount set differs from the running '$container'. It will be:"
-		printf '%s\n' "$desired" | while read -r m; do [ -n "$m" ] && printf "  ${YELLOW}%s${NC}\n" "$m"; done
+		info "Config differs from the running '$container'. It will have:"
+		printf '%s\n' "$desired" | while read -r m; do [ -n "$m" ] && printf "  mount ${YELLOW}%s${NC}\n" "$m"; done
+		printf "  ports ${YELLOW}%s${NC}\n" "$(format_ports "$desired_ports")"
 		printf "\nRecreate '%s' now to apply? [y/n] " "$container"
 		read -r ans
 		case "$ans" in
@@ -924,14 +1019,16 @@ cmd_up() {
 		[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
 		desired=$(build_mount_list "$mode" "$folder" "$mounts_dir" 2>/dev/null | sort -u)
 		current=$(current_folder_mounts "$container" "$name_dir")
-		if [ "$desired" = "$current" ] &&
+		desired_p=$(printf '%s\n' "$desired_ports" | sort -u)
+		current_p=$(current_port_bindings "$container")
+		if [ "$desired" = "$current" ] && [ "$desired_p" = "$current_p" ] &&
 			image_up_to_date "$image" "$dockerfile" "$context" "$folder" &&
 			[ "$(container_keepalive "$container")" = "$keep_alive" ]; then
 			info "Resuming '$container'..."
 			docker start "$container" >/dev/null
 			printf "\n"
 			success "Container resumed!"
-			printf "Port ${YELLOW}%s${NC} → container:8000\n\n" "$(cat "$name_dir/port" 2>/dev/null || echo '?')"
+			printf "Ports ${YELLOW}%s${NC}\n\n" "$(format_ports "$desired_ports")"
 			attach_container "$name"
 			exit 0
 		fi
@@ -949,7 +1046,7 @@ cmd_up() {
 			printf "  Folder:     ${YELLOW}%s${NC} (saved to the set)\n" "$folder"
 		fi
 		printf "  Container:  ${YELLOW}%s${NC}\n" "$container"
-		printf "  Port:       ${YELLOW}%s${NC} → 8000\n" "$port"
+		printf "  Ports:      ${YELLOW}%s${NC}\n" "$(format_ports "$desired_ports")"
 		printf "  Dockerfile: ${YELLOW}%s${NC}\n" "$dockerfile"
 		if [ "$keep_alive" = "true" ]; then
 			printf "  Run mode:   ${YELLOW}keep-alive${NC} (stays up until stopped)\n"
@@ -973,7 +1070,7 @@ cmd_up() {
 	fi
 
 	mkdir -p "$name_dir"
-	printf '%s' "$port" >"$name_dir/port"
+	printf '%s\n' "$desired_ports" >"$name_dir/ports"
 	printf '%s' "$folder" >"$name_dir/folder"
 	[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
 	if [ "$keep_alive" = "true" ]; then : >"$keepalive_marker"; else rm -f "$keepalive_marker"; fi
@@ -997,11 +1094,11 @@ cmd_up() {
 	dev_user=$(resolve_username "$dockerfile" "$name")
 	dev_fullname=$(read_fullname "$name_dir" "$name")
 	build_image "$image" "$dockerfile" "$context" "$folder" "$dev_user" "$dev_fullname"
-	run_container "$name" "$port" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list" "$keep_alive"
+	run_container "$name" "$desired_ports" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list" "$keep_alive"
 
 	printf "\n"
 	success "Container ready!"
-	printf "Port ${YELLOW}%s${NC} → container:8000\n" "$port"
+	printf "Ports ${YELLOW}%s${NC}\n" "$(format_ports "$desired_ports")"
 	if [ "$keep_alive" != "true" ]; then
 		printf "${CYAN}Idle-suspend on: exit every shell and it stops in ~%ss. Resume with 'dev! %s'.${NC}\n" "${DEV_SUSPEND_IDLE:-20}" "$name"
 	fi
@@ -1024,7 +1121,14 @@ cmd_list() {
 		[ -d "$d" ] || continue
 		found=true
 		name=$(basename "$d")
-		port=$(cat "$d/port" 2>/dev/null || echo "?")
+		pcontent=$(cat "$d/ports" 2>/dev/null || true)
+		if [ -n "$pcontent" ]; then
+			port=$(primary_host_port "$pcontent")
+			np=$(printf '%s\n' "$pcontent" | grep -c '.')
+			[ "$np" -gt 1 ] && port="$port+$((np - 1))"
+		else
+			port="?"
+		fi
 		n=$(count_mounts "$d/mounts")
 		if [ "$n" -eq 0 ]; then
 			folder=$(cat "$d/folder" 2>/dev/null || echo "?")
@@ -1051,7 +1155,8 @@ cmd_kill() {
 	[ -n "$name" ] || error "Usage: dev! kill <name>"
 	container="dev-$name"
 	name_dir="$STATE_HOME/$name"
-	port=$(cat "$name_dir/port" 2>/dev/null || echo "?")
+	port=$(primary_host_port "$(cat "$name_dir/ports" 2>/dev/null || true)")
+	[ -n "$port" ] || port="?"
 
 	printf "\n${RED}Will kill:${NC}\n"
 	printf "  Container: ${YELLOW}%s${NC}\n" "$container"
@@ -1282,8 +1387,9 @@ main() {
 		docker_sock=false
 		mode=""
 		keep_alive=""
-		for arg in "$@"; do
-			case "$arg" in
+		port_specs=""
+		while [ $# -gt 0 ]; do
+			case "$1" in
 			--docker) docker_sock=true ;;
 			--keep-alive) keep_alive=true ;;
 			--save)
@@ -1294,11 +1400,18 @@ main() {
 				[ -n "$mode" ] && error "--save and --only are mutually exclusive"
 				mode=only
 				;;
-			-*) error "Unknown option: $arg" ;;
-			*) folder_arg="$arg" ;;
+			--port)
+				shift
+				[ -n "$1" ] || error "--port needs a value (C or H:C)"
+				port_specs="$port_specs $1"
+				;;
+			--port=*) port_specs="$port_specs ${1#--port=}" ;;
+			-*) error "Unknown option: $1" ;;
+			*) folder_arg="$1" ;;
 			esac
+			shift
 		done
-		cmd_up "$name" "$folder_arg" "$docker_sock" "$mode" "$keep_alive"
+		cmd_up "$name" "$folder_arg" "$docker_sock" "$mode" "$keep_alive" "$port_specs"
 		;;
 	esac
 }

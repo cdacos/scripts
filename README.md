@@ -14,10 +14,9 @@ dev! scratch              # Container 'dev-scratch' on the current dir
 dev! ci . --docker        # Also mount the host Docker socket (root-equivalent — opt-in)
 dev!                      # List all containers (NAME, PORT, STATUS, FOLDER)
 dev! kill api             # Tear down 'dev-api' and delete its state
-dev! init node:20         # Skeleton Dockerfile.dev here (--global for the fallback)
 ```
 
-If a folder has no `Dockerfile.dev` and no `~/.local/dev-container/Dockerfile` yet, a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux) is written to the fallback path on first use. Run `dev! init` (no base image) to regenerate that default, or `dev! init <base-image>` for a minimal skeleton to fill in.
+Each container owns its own Dockerfile at `~/.local/dev-container/<name>/Dockerfile`, written from a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux) on first create. It's bind-mounted read-write at `/home/dev/Dockerfile`, so the container can edit its own build recipe — the change takes effect on the next `dev! <name>` recreate. The target folder's own Dockerfiles are ignored; copy from them by hand if you want.
 
 ### `dev-container-per-repo.sh`
 

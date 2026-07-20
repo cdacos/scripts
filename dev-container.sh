@@ -9,14 +9,14 @@
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="3.0"
+VERSION="2.4"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
 
 show_help() {
 	cat <<'EOF'
-Usage: dev! [name] [folder] [--save|--only] [--docker]
+Usage: dev! [name] [folder] [--save|--only] [--keep-alive] [--docker]
        dev! kill <name>
        dev! completion bash|zsh
        dev! -h | --help
@@ -24,18 +24,29 @@ Usage: dev! [name] [folder] [--save|--only] [--docker]
 
 Launches a named Docker dev container. A container remembers every folder you
 SAVE to it and mounts them all (rw), at their real absolute paths, plus its own
-persistent state. Free of git repos and worktrees.
+persistent state. By default it suspends itself when you're not using it. Free of
+git repos and worktrees.
 
 Commands:
   (no args)                List all containers: NAME, PORT, STATUS, FOLDERS
-  <name> [folder]          Create/start container; ask whether to save the folder
+  <name> [folder]          Create/resume container; ask whether to save the folder
   <name> [folder] --save   Add folder to the set, mount the whole set
   <name> [folder] --only   Mount JUST this folder, don't remember it
+  <name> ... --keep-alive  Don't self-suspend; run until stopped (see Idle-suspend)
   <name> ... --docker      Also mount /var/run/docker.sock (see Isolation below)
   kill <name>              Stop+remove container and image, delete its state dir
   completion bash|zsh      Output shell completion code
   -h, --help               Show this help
   --version                Print version and exit
+
+Idle-suspend (default on):
+  A container's PID 1 is a supervisor that stops the container once no interactive
+  shell has been attached for ~20s (override with DEV_SUSPEND_IDLE). Effectively:
+  keep a shell open to keep it alive; exit every shell and it suspends. Resume with
+  `dev! <name>` - if nothing changed that's a fast `docker start` that preserves the
+  in-container filesystem. Sessions are counted as ptys, so BACKGROUND/detached work
+  (a dev server on :8000, a bus agent) does NOT hold it open - use --keep-alive for
+  those (it sticks; revert with: rm <STATE_HOME>/<name>/keep-alive).
 
 Mount set (accumulated folders):
   Each container keeps a set of remembered folders as symlinks under
@@ -52,8 +63,8 @@ Mount set (accumulated folders):
 Start semantics:
   running   -> if the mount set is unchanged, report and quit; otherwise offer to
                recreate to apply the change (attach: docker exec -it -u dev dev-<name> bash)
-  stopped   -> recreate with the resolved mount set (reuses the stored port and bus
-               token), then attach
+  stopped   -> if the mount set, image and run-mode are unchanged, fast-resume via
+               `docker start` (keeps the in-container fs); else recreate. Then attach.
   none      -> confirm, run the token flow, build, run, attach
   Folder default is the current dir. The working dir is always the folder you pass.
 
@@ -68,6 +79,7 @@ State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
   <STATE_HOME>/<name>/mounts saved folders, one symlink each (name = abs path with
                              '/' as backtick, target = the folder). rm one to forget it.
   <STATE_HOME>/<name>/folder last folder path (working-dir hint / legacy fallback)
+  <STATE_HOME>/<name>/keep-alive  marker: present => opt out of idle-suspend (rm to revert)
   <STATE_HOME>/<name>/claude persistent /home/dev/.claude (seeded once from ~/.claude)
 
 Env files:
@@ -575,6 +587,22 @@ build_signature() {
 	token_sha256 "$sig_content"
 }
 
+# True when image exists and its stored build signature matches the current one
+# (Dockerfile + build args unchanged). Gates both the build-skip and fast resume.
+image_up_to_date() {
+	docker image inspect "$1" >/dev/null 2>&1 || return 1
+	[ -f "$3/.build-sig" ] || return 1
+	[ "$(cat "$3/.build-sig")" = "$(build_signature "$2" "$4")" ]
+}
+
+# Echo "true" if the container's baked command is the keep-alive daemon (tail),
+# "false" if it's the self-suspend supervisor. Used to decide whether a resume can
+# reuse the existing container or must recreate to change run-mode.
+container_keepalive() {
+	docker inspect -f '{{json .Config.Cmd}}' "$1" 2>/dev/null | grep -q '"tail"' &&
+		echo true || echo false
+}
+
 # Build the image. dockerfile + context differ by resolution; project_path drives path parity.
 build_image() {
 	image="$1"
@@ -584,13 +612,12 @@ build_image() {
 
 	# Skip the build when the image already exists and nothing that feeds it has
 	# changed (same Dockerfile + same build args). Keeps folder-add recreates fast.
-	sig=$(build_signature "$dockerfile" "$project_path")
-	sig_file="$context/.build-sig"
-	if docker image inspect "$image" >/dev/null 2>&1 &&
-		[ -f "$sig_file" ] && [ "$(cat "$sig_file")" = "$sig" ]; then
+	if image_up_to_date "$image" "$dockerfile" "$context" "$project_path"; then
 		info "Image '$image' is up to date (skipping build)."
 		return 0
 	fi
+	sig=$(build_signature "$dockerfile" "$project_path")
+	sig_file="$context/.build-sig"
 
 	token_file=""
 	if [ -n "${GITHUB_TOKEN_DOTFILES:-}" ]; then
@@ -614,9 +641,32 @@ build_image() {
 	printf '%s' "$sig" >"$sig_file"
 }
 
+# The container's PID 1. By default a self-suspend supervisor: it waits for the
+# first interactive session, then exits (stopping the container) once no session
+# has been attached for DEV_SUSPEND_IDLE seconds. Sessions are counted as numeric
+# slave nodes under /dev/pts (every `docker exec -it` allocates one), so it tracks
+# ALL attached shells, not just the one dev! launched. Background/detached work
+# holds no pty, so it does NOT keep the container alive - see --keep-alive.
+SUPERVISOR_CMD='
+idle_limit=${DEV_SUSPEND_IDLE:-20}
+startup_limit=${DEV_SUSPEND_STARTUP:-120}
+count() { ls /dev/pts 2>/dev/null | grep -c "^[0-9]"; }
+waited=0
+while [ "$(count)" -eq 0 ] && [ "$waited" -lt "$startup_limit" ]; do
+  sleep 2
+  waited=$((waited + 2))
+done
+idle=0
+while [ "$idle" -lt "$idle_limit" ]; do
+  if [ "$(count)" -gt 0 ]; then idle=0; else idle=$((idle + 2)); fi
+  sleep 2
+done
+'
+
 # Run the container. env files are added only if present (docker errors on a
 # missing one). Every folder in mount_list (newline-separated) is bind-mounted at
-# the same absolute path; cwd is this invocation's folder.
+# the same absolute path; cwd is this invocation's folder. keep_alive=true swaps
+# the self-suspend supervisor for a plain never-exit daemon.
 run_container() {
 	name="$1"
 	port="$2"
@@ -628,6 +678,7 @@ run_container() {
 	name_env="$8"
 	dockerfile="$9"
 	mount_list="${10}"
+	keep_alive="${11}"
 
 	claude_creds=$(get_claude_credentials)
 	claude_json=$(get_claude_json)
@@ -657,7 +708,11 @@ run_container() {
 
 	[ "$docker_sock" = "true" ] && set -- "$@" -v /var/run/docker.sock:/var/run/docker.sock
 
-	set -- "$@" "$image" tail -f /dev/null
+	if [ "$keep_alive" = "true" ]; then
+		set -- "$@" "$image" tail -f /dev/null
+	else
+		set -- "$@" "$image" sh -c "$SUPERVISOR_CMD"
+	fi
 
 	info "Starting container 'dev-$name'..."
 	docker run "$@"
@@ -695,12 +750,14 @@ prompt_mode() {
 	esac
 }
 
-# Create or start a container. mode is "save", "only", or "" (prompt if it matters).
+# Create, resume, or start a container. mode is "save"/"only"/"" (prompt if it
+# matters); keep_alive is "true" (opt out of idle-suspend) or "".
 cmd_up() {
 	name=$(slugify "$1")
 	folder_arg="${2:-.}"
 	docker_sock="$3"
 	mode="$4"
+	keep_alive="$5"
 	[ -n "$name" ] || error "Invalid name"
 
 	container="dev-$name"
@@ -711,6 +768,7 @@ cmd_up() {
 	mounts_dir="$name_dir/mounts"
 	dockerfile="$name_dir/Dockerfile"
 	context="$name_dir"
+	keepalive_marker="$name_dir/keep-alive"
 
 	folder=$(resolve_folder "$folder_arg")
 	migrate_legacy_folder "$name_dir"
@@ -725,11 +783,20 @@ cmd_up() {
 		fi
 	fi
 
+	# Resolve keep-alive: the --keep-alive flag wins and sticks (marker file);
+	# otherwise inherit the stored marker. Default is idle-suspend. Revert a
+	# keep-alive container with: rm <name>/keep-alive.
+	if [ "$keep_alive" != "true" ]; then
+		[ -f "$keepalive_marker" ] && keep_alive=true || keep_alive=false
+	fi
+
 	ensure_shared_env
 	load_env_files "$shared_env" "$name_env"
 	port=$(allocate_port "$name_dir")
 
 	status=$(get_container_status "$container")
+	first_create=false
+	[ "$status" = "none" ] && first_create=true
 
 	# Running: compare the running mount set to what this invocation wants. Same ->
 	# just report. Different -> the change (a newly saved folder, or --only) needs a
@@ -762,8 +829,28 @@ cmd_up() {
 		status=stopped
 	fi
 
+	# Fast resume: a stopped container whose mount set, image, and run-mode are all
+	# unchanged just needs `docker start` - no rebuild, no recreate, and the
+	# in-container filesystem is preserved. This is the suspend/resume happy path.
+	if [ "$status" = "stopped" ]; then
+		[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
+		desired=$(build_mount_list "$mode" "$folder" "$mounts_dir" 2>/dev/null | sort -u)
+		current=$(current_folder_mounts "$container" "$name_dir")
+		if [ "$desired" = "$current" ] &&
+			image_up_to_date "$image" "$dockerfile" "$context" "$folder" &&
+			[ "$(container_keepalive "$container")" = "$keep_alive" ]; then
+			info "Resuming '$container'..."
+			docker start "$container" >/dev/null
+			printf "\n"
+			success "Container resumed!"
+			printf "Port ${YELLOW}%s${NC} → container:8000\n\n" "$(cat "$name_dir/port" 2>/dev/null || echo '?')"
+			attach_container "$name"
+			exit 0
+		fi
+	fi
+
 	# First create: confirm before writing any state (an abort leaves nothing behind).
-	if [ "$status" = "none" ]; then
+	if [ "$first_create" = true ]; then
 		printf "\n"
 		info "Will create:"
 		printf "  Name:       ${YELLOW}%s${NC}\n" "$name"
@@ -775,6 +862,11 @@ cmd_up() {
 		printf "  Container:  ${YELLOW}%s${NC}\n" "$container"
 		printf "  Port:       ${YELLOW}%s${NC} → 8000\n" "$port"
 		printf "  Dockerfile: ${YELLOW}%s${NC}\n" "$dockerfile"
+		if [ "$keep_alive" = "true" ]; then
+			printf "  Run mode:   ${YELLOW}keep-alive${NC} (stays up until stopped)\n"
+		else
+			printf "  Run mode:   ${YELLOW}suspend when idle${NC} (stops ~%ss after the last shell exits)\n" "${DEV_SUSPEND_IDLE:-20}"
+		fi
 		[ "$docker_sock" = "true" ] && printf "  ${RED}docker.sock: mounted (root-equivalent host access)${NC}\n"
 		printf "\nContinue? [y/n] "
 		read -r answer
@@ -787,7 +879,7 @@ cmd_up() {
 		esac
 		printf "\n"
 	else
-		info "Recreating stopped container '$container'..."
+		info "Recreating '$container'..."
 		docker rm "$container" >/dev/null 2>&1 || true
 	fi
 
@@ -795,6 +887,7 @@ cmd_up() {
 	printf '%s' "$port" >"$name_dir/port"
 	printf '%s' "$folder" >"$name_dir/folder"
 	[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
+	if [ "$keep_alive" = "true" ]; then : >"$keepalive_marker"; else rm -f "$keepalive_marker"; fi
 
 	if [ ! -f "$dockerfile" ]; then
 		write_default_dockerfile "$dockerfile"
@@ -807,15 +900,19 @@ cmd_up() {
 	mount_list=$(build_mount_list "$mode" "$folder" "$mounts_dir")
 	printf '%s\n' "$mount_list" | while read -r m; do [ -n "$m" ] && warn_git "$m"; done
 
-	[ "$status" = "none" ] && ensure_token "$name" "$name_dir" "$name_env"
+	[ "$first_create" = true ] && ensure_token "$name" "$name_dir" "$name_env"
 	seed_claude "$name_dir/claude"
-	[ "$status" = "none" ] && ensure_persona "$name" "$name_dir/claude"
+	[ "$first_create" = true ] && ensure_persona "$name" "$name_dir/claude"
 	build_image "$image" "$dockerfile" "$context" "$folder"
-	run_container "$name" "$port" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list"
+	run_container "$name" "$port" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list" "$keep_alive"
 
 	printf "\n"
 	success "Container ready!"
-	printf "Port ${YELLOW}%s${NC} → container:8000\n\n" "$port"
+	printf "Port ${YELLOW}%s${NC} → container:8000\n" "$port"
+	if [ "$keep_alive" != "true" ]; then
+		printf "${CYAN}Idle-suspend on: exit every shell and it stops in ~%ss. Resume with 'dev! %s'.${NC}\n" "${DEV_SUSPEND_IDLE:-20}" "$name"
+	fi
+	printf "\n"
 	attach_container "$name"
 }
 
@@ -1086,9 +1183,11 @@ main() {
 		folder_arg="."
 		docker_sock=false
 		mode=""
+		keep_alive=""
 		for arg in "$@"; do
 			case "$arg" in
 			--docker) docker_sock=true ;;
+			--keep-alive) keep_alive=true ;;
 			--save)
 				[ -n "$mode" ] && error "--save and --only are mutually exclusive"
 				mode=save
@@ -1101,7 +1200,7 @@ main() {
 			*) folder_arg="$arg" ;;
 			esac
 		done
-		cmd_up "$name" "$folder_arg" "$docker_sock" "$mode"
+		cmd_up "$name" "$folder_arg" "$docker_sock" "$mode" "$keep_alive"
 		;;
 	esac
 }

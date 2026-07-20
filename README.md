@@ -6,13 +6,26 @@ Shared developer utility scripts.
 
 ### `dev-container.sh` (aka `dev!`)
 
-Git worktree + Docker dev container launcher. Creates isolated dev environments where each branch gets its own worktree and container with a unique port.
+Folder-based Docker dev container launcher. `dev! <name> [folder]` starts a named container that mounts **only** the given folder (default: current dir) plus its own persistent state under `~/.local/dev-container/<name>/` (bus token, Claude home, port) — nothing else on the host. `docker.sock` is not mounted unless you pass `--docker`.
 
 ```sh
-dev! feature-auth         # Create/attach to branch
+dev! api ~/src/api        # Create/start container 'dev-api' mounting ~/src/api
+dev! scratch              # Container 'dev-scratch' on the current dir
+dev! ci . --docker        # Also mount the host Docker socket (root-equivalent — opt-in)
+dev!                      # List all containers (NAME, PORT, STATUS, FOLDER)
+dev! kill api             # Tear down 'dev-api' and delete its state
+dev! init node:20         # Skeleton Dockerfile.dev here (--global for the fallback)
+```
+
+If a folder has no `Dockerfile.dev` and no `~/.local/dev-container/Dockerfile` yet, a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux) is written to the fallback path on first use. Run `dev! init` (no base image) to regenerate that default, or `dev! init <base-image>` for a minimal skeleton to fill in.
+
+### `dev-container-per-repo.sh`
+
+The previous, git-worktree-based `dev!`. Pairs each branch with a worktree + container under `../{repo}.worktrees/{port}/{branch}/`, mounting the whole repo. Kept for repo/worktree-centric workflows; use `dev-container.sh` (above) for the newer folder-based model.
+
+```sh
+dev! feature-auth         # Create/attach a worktree + container for a branch
 dev! kill feature-auth    # Tear down container + worktree
-dev!                      # List all worktrees
-dev! init node:20         # Generate skeleton Dockerfile.dev
 ```
 
 ### `agent-bus/`

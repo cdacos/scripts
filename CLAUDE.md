@@ -32,6 +32,8 @@ Both tools are preinstalled in the dev container (`dev-container.sh`'s embedded 
 
 The main script. `dev! <name> [folder] [--docker]` launches a named Docker container that mounts **only** the given folder (default cwd) plus its own persistent state — nothing else on the host. No git worktrees, no repo bind-mount. (Rewritten from the old worktree/port-dir model; pre-existing worktree containers keep running but are unmanageable by this script.)
 
+- **Versioning**: the `VERSION` constant near the top of the script (`dev! --version` prints it, currently `2.0`). Bump it whenever you make a user-visible behavior change.
+
 - **State home** `~/.local/dev-container/` (override with `DEV_CONTAINER_HOME`, used by tests) is the only state store: a shared `.env`, a fallback `Dockerfile`, and one `<name>/` dir per container holding `.env` (per-name), `port` (plain text), `folder` (last mounted path), and `claude/` (persistent `/home/dev/.claude`).
 - **Naming**: container and image are both `dev-<name>` (namespaces are separate); names are slugified. Host `port` maps to container port 8000.
 - **Env hierarchy** (`load_env_files`): host env → shared `.env` → per-name `.env`, later wins. Both files are plain `KEY=value` (no quotes/`$expansion`) so they are both **sh-sourced at build time** (driving `GITHUB_TOKEN_DOTFILES`/`GITHUB_USERNAME`/`GITCONFIG`) and passed to the container via `docker run --env-file` (added only if the file exists — docker errors on a missing one). `port` is deliberately kept out of `.env` so no `PORT` var leaks to web frameworks. Everything in these files is visible in the container at runtime; only the dotfiles token stays out of image layers via the BuildKit secret.

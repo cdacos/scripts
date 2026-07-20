@@ -8,6 +8,9 @@
 
 set -e
 
+# Bump this on user-visible behavior changes (see CLAUDE.md).
+VERSION="2.0"
+
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
 
@@ -18,6 +21,7 @@ Usage: dev! [name] [folder] [--docker]
        dev! init <base-image> [--global]
        dev! completion bash|zsh
        dev! -h | --help
+       dev! --version
 
 Launches a named Docker dev container that mounts ONLY the given folder (rw) plus
 its own persistent state. Free of git repos and worktrees.
@@ -32,6 +36,7 @@ Commands:
   init [base-image] --global   Same, but write ~/.local/dev-container/Dockerfile
   completion bash|zsh      Output shell completion code
   -h, --help               Show this help
+  --version                Print version and exit
 
 Start semantics:
   running   -> report and quit (attach with: docker exec -it -u dev dev-<name> bash)
@@ -772,6 +777,10 @@ main() {
 	case "$cmd" in
 	-h | --help)
 		show_help
+		exit 0
+		;;
+	--version)
+		echo "$VERSION"
 		exit 0
 		;;
 	kill)

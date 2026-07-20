@@ -9,7 +9,7 @@
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="2.4"
+VERSION="2.5"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
@@ -62,7 +62,7 @@ Mount set (accumulated folders):
 
 Start semantics:
   running   -> if the mount set is unchanged, report and quit; otherwise offer to
-               recreate to apply the change (attach: docker exec -it -u dev dev-<name> bash)
+               recreate to apply the change (attach: docker exec -it -u <user> dev-<name> bash)
   stopped   -> if the mount set, image and run-mode are unchanged, fast-resume via
                `docker start` (keeps the in-container fs); else recreate. Then attach.
   none      -> confirm, run the token flow, build, run, attach
@@ -73,14 +73,15 @@ State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
                              GITHUB_TOKEN_DOTFILES, GITCONFIG, ...) - loaded first
   <STATE_HOME>/<name>/.env   per-name KEY=value (AGENT_BUS_TOKEN + overrides) - wins
   <STATE_HOME>/<name>/Dockerfile  per-name build recipe (default on first create;
-                             bind-mounted rw at /home/dev/Dockerfile so the container
+                             bind-mounted rw at ~/Dockerfile so the container
                              can edit it - takes effect on the next recreate)
   <STATE_HOME>/<name>/port   host port (plain text; deliberately NOT in .env)
   <STATE_HOME>/<name>/mounts saved folders, one symlink each (name = abs path with
                              '/' as backtick, target = the folder). rm one to forget it.
   <STATE_HOME>/<name>/folder last folder path (working-dir hint / legacy fallback)
+  <STATE_HOME>/<name>/fullname  the login user's GECOS display name (asked on create)
   <STATE_HOME>/<name>/keep-alive  marker: present => opt out of idle-suspend (rm to revert)
-  <STATE_HOME>/<name>/claude persistent /home/dev/.claude (seeded once from ~/.claude)
+  <STATE_HOME>/<name>/claude persistent ~/.claude (seeded once from host ~/.claude)
 
 Env files:
   Plain KEY=value only (no quotes, no $expansion) so the same file can be sh-sourced
@@ -92,7 +93,7 @@ Env files:
 Dockerfile:
   Each container has its OWN Dockerfile at <STATE_HOME>/<name>/Dockerfile, written
   from a batteries-included default on first create. It is bind-mounted rw at
-  /home/dev/Dockerfile, so the container can edit its own build recipe; changes take
+  ~/Dockerfile, so the container can edit its own build recipe; changes take
   effect on the next recreate. The target folder's own Dockerfile(s) are ignored -
   crib from them by hand if you like. Build context is <STATE_HOME>/<name>/ (a
   .dockerignore keeps its state and secrets out of the context).
@@ -110,6 +111,17 @@ Persona flow (on first create, optional):
   or (s)kip. The bio is saved to <name>/claude/persona.md and imported from the
   container's CLAUDE.md via an '@persona.md' line (the seeded CLAUDE.md is left
   otherwise untouched). Skipped or empty personas write nothing.
+
+Identity:
+  The container's login user and home are named after it: container 'speedy' runs
+  as user 'speedy' with home /home/speedy. Hyphens in the name become underscores
+  in the user, so 'speedy-gonzales' -> user 'speedy_gonzales'. On first create you
+  are asked for the user's full name (GECOS, shown by finger/pinky), defaulting to
+  the title-cased name - so 'speedy' offers "Speedy" but you can type "Speedy
+  Gonzales". It is saved to <name>/fullname and reused on every recreate. The host
+  UID/GID still drive the user, so bind-mount permissions are unchanged. Containers
+  created before v2.5 keep the old 'dev'/'home/dev' (detected from their
+  Dockerfile), so upgrades don't break them.
 
 Isolation (be honest):
   The container sees ONLY the folders you have saved to it (or, with --only, the
@@ -155,6 +167,44 @@ success() {
 # Slugify a string: lowercase, replace special chars with hyphens
 slugify() {
 	echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//'
+}
+
+# Derive a valid Unix username from a container name (slug). Hyphens become
+# underscores; a leading non-letter or a clash with a common system account is
+# prefixed with 'u_'. Keeps `whoami` legible while staying adduser-safe. 'dev' is
+# left as-is (it is the historical user and a normal, unprivileged account).
+container_username() {
+	u=$(printf '%s' "$1" | tr '-' '_')
+	case "$u" in
+	[a-z_]*) ;;
+	*) u="u_$u" ;;
+	esac
+	case "$u" in
+	dev) ;;
+	root | bin | daemon | sys | sync | games | man | lp | mail | news | uucp | operator | nobody | sshd | postgres)
+		u="u_$u"
+		;;
+	esac
+	printf '%s' "$u"
+}
+
+# Title-cased display name (GECOS) from a slug: hyphens become spaces, each word is
+# capitalized. 'speedy' -> "Speedy", 'speedy-gonzales' -> "Speedy Gonzales".
+container_fullname() {
+	printf '%s' "$1" | tr '-' ' ' | awk '{for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2)} 1'
+}
+
+# The in-container login user for a container. New-style Dockerfiles declare
+# `ARG DEV_USER` and get a per-name user + /home/<user>; pre-2.5 Dockerfiles (and
+# any the user stripped DEV_USER out of) keep the historical 'dev'. Grepping the
+# actual build recipe keeps the build arg, mount paths, and attach user in sync,
+# so existing containers are never mismatched by an upgrade.
+resolve_username() {
+	if [ -f "$1" ] && grep -q '^ARG DEV_USER' "$1"; then
+		container_username "$2"
+	else
+		echo dev
+	fi
 }
 
 # Get Claude credentials from macOS Keychain (empty on non-macOS or if not found)
@@ -407,6 +457,7 @@ ensure_dockerignore() {
 .env
 port
 folder
+fullname
 claude
 mounts
 .build-sig
@@ -415,7 +466,7 @@ EOF
 	fi
 	# Upgrade older ignore files (mounts/ can contain symlinks to large host
 	# folders; .build-sig is the build cache marker - neither belongs in context).
-	for entry in mounts .build-sig; do
+	for entry in mounts .build-sig fullname; do
 		grep -qxF "$entry" "$di" || printf '%s\n' "$entry" >>"$di"
 	done
 }
@@ -574,6 +625,36 @@ ensure_persona() {
 	success "Persona written to $persona_file"
 }
 
+# Prompt (first create only) for the login user's GECOS display name, defaulting to
+# the title-cased container name. A single word like 'speedy' derives "Speedy", so
+# this is the chance to give it a real full name ("Speedy Gonzales"). Persisted to
+# <name>/fullname so recreates keep it; blank accepts the default.
+ensure_fullname() {
+	name="$1"
+	name_dir="$2"
+	ff="$name_dir/fullname"
+	[ -f "$ff" ] && return 0
+	default=$(container_fullname "$name")
+	printf "\n"
+	printf "${CYAN}Full name for the '%s' user (GECOS, shown by finger/pinky)?${NC}\n" "$(container_username "$name")"
+	printf "Full name [%s]: " "$default"
+	read -r fn
+	[ -z "$fn" ] && fn="$default"
+	mkdir -p "$name_dir"
+	printf '%s' "$fn" >"$ff"
+	success "Full name set to '$fn'."
+}
+
+# The persisted GECOS full name, or the title-cased container name if none is saved
+# (legacy containers, or one whose fullname file was removed).
+read_fullname() {
+	if [ -s "$1/fullname" ]; then
+		cat "$1/fullname"
+	else
+		container_fullname "$2"
+	fi
+}
+
 # A signature of everything that affects the built image: the Dockerfile plus the
 # build args passed to it. Stored after a successful build so unchanged recreates
 # can skip `docker build` entirely (recreates are then just docker rm + run).
@@ -609,6 +690,8 @@ build_image() {
 	dockerfile="$2"
 	context="$3"
 	project_path="$4"
+	dev_user="$5"
+	dev_fullname="$6"
 
 	# Skip the build when the image already exists and nothing that feeds it has
 	# changed (same Dockerfile + same build args). Keeps folder-add recreates fast.
@@ -634,6 +717,8 @@ build_image() {
 		--build-arg HOST_PROJECT_PATH="${project_path}" \
 		--build-arg HOST_UID="$(id -u)" \
 		--build-arg HOST_GID="$(id -g)" \
+		--build-arg DEV_USER="${dev_user}" \
+		--build-arg DEV_FULLNAME="${dev_fullname}" \
 		-t "$image" "$context"
 	docker "$@"
 
@@ -682,6 +767,7 @@ run_container() {
 
 	claude_creds=$(get_claude_credentials)
 	claude_json=$(get_claude_json)
+	dev_user=$(resolve_username "$dockerfile" "$name")
 
 	set -- --init -d \
 		--name "dev-$name" \
@@ -702,8 +788,8 @@ run_container() {
 	IFS=$oldifs
 
 	set -- "$@" \
-		-v "${claude_dir}:/home/dev/.claude" \
-		-v "${dockerfile}:/home/dev/Dockerfile" \
+		-v "${claude_dir}:/home/${dev_user}/.claude" \
+		-v "${dockerfile}:/home/${dev_user}/Dockerfile" \
 		-w "${cwd}"
 
 	[ "$docker_sock" = "true" ] && set -- "$@" -v /var/run/docker.sock:/var/run/docker.sock
@@ -718,9 +804,11 @@ run_container() {
 	docker run "$@"
 }
 
-# Attach an interactive shell as the dev user.
+# Attach an interactive shell as the container's login user (self-resolved from
+# its Dockerfile so fast-resume and recreate paths all agree on the user).
 attach_container() {
-	docker exec -it -e TERM=xterm-256color -e COLORTERM=truecolor -u dev "dev-$1" bash
+	au_user=$(resolve_username "$STATE_HOME/$1/Dockerfile" "$1")
+	docker exec -it -e TERM=xterm-256color -e COLORTERM=truecolor -u "$au_user" "dev-$1" bash
 }
 
 # Prompt for the mount mode (save vs only) when no flag was given. Echoes the
@@ -808,7 +896,7 @@ cmd_up() {
 		if [ "$desired" = "$current" ]; then
 			info "Container '$container' is already running."
 			printf "Port ${YELLOW}%s${NC} → container:8000\n" "$(cat "$name_dir/port" 2>/dev/null || echo '?')"
-			printf "Attach with: ${CYAN}docker exec -it -u dev %s bash${NC}\n" "$container"
+			printf "Attach with: ${CYAN}docker exec -it -u %s %s bash${NC}\n" "$(resolve_username "$dockerfile" "$name")" "$container"
 			exit 0
 		fi
 		printf "\n"
@@ -854,6 +942,7 @@ cmd_up() {
 		printf "\n"
 		info "Will create:"
 		printf "  Name:       ${YELLOW}%s${NC}\n" "$name"
+		printf "  User:       ${YELLOW}%s${NC} (home /home/%s; full name asked below)\n" "$(container_username "$name")" "$(container_username "$name")"
 		if [ "$mode" = only ]; then
 			printf "  Folder:     ${YELLOW}%s${NC} (only - not saved)\n" "$folder"
 		else
@@ -891,7 +980,7 @@ cmd_up() {
 
 	if [ ! -f "$dockerfile" ]; then
 		write_default_dockerfile "$dockerfile"
-		info "Wrote default Dockerfile for '$name' to $dockerfile (edit it there, or /home/dev/Dockerfile inside the container)."
+		info "Wrote default Dockerfile for '$name' to $dockerfile (edit it there, or ~/Dockerfile inside the container)."
 	fi
 	ensure_dockerignore "$name_dir"
 
@@ -903,7 +992,11 @@ cmd_up() {
 	[ "$first_create" = true ] && ensure_token "$name" "$name_dir" "$name_env"
 	seed_claude "$name_dir/claude"
 	[ "$first_create" = true ] && ensure_persona "$name" "$name_dir/claude"
-	build_image "$image" "$dockerfile" "$context" "$folder"
+	[ "$first_create" = true ] && ensure_fullname "$name" "$name_dir"
+	# The Dockerfile now exists, so this reflects the real (new-style vs legacy) user.
+	dev_user=$(resolve_username "$dockerfile" "$name")
+	dev_fullname=$(read_fullname "$name_dir" "$name")
+	build_image "$image" "$dockerfile" "$context" "$folder" "$dev_user" "$dev_fullname"
 	run_container "$name" "$port" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list" "$keep_alive"
 
 	printf "\n"
@@ -1003,7 +1096,7 @@ cmd_kill() {
 # Write the batteries-included default Dockerfile to $1. Alpine-based: bash/git/curl,
 # Claude Code, chezmoi dotfiles, tmux, and an entrypoint that materializes Claude
 # creds from env. Written once per container to <STATE_HOME>/<name>/Dockerfile on
-# first create, then owned/editable by that container via the /home/dev/Dockerfile mount.
+# first create, then owned/editable by that container via the ~/Dockerfile mount.
 # Quoted heredoc: everything below is literal (Dockerfile ARGs, not shell vars).
 write_default_dockerfile() {
 	cat >"$1" <<'DOCKERFILE'
@@ -1034,31 +1127,49 @@ ARG GITHUB_USERNAME=""   # For dotfiles repo (optional)
 ARG HOST_PROJECT_PATH="/home/dev/src"  # Target folder path, for path parity with host
 ARG HOST_UID=1000        # Host user's UID (for volume permission parity)
 ARG HOST_GID=1000        # Host user's GID
+ARG DEV_USER=dev         # In-container login user + home (defaults to the container name)
+ARG DEV_FULLNAME=Developer  # GECOS display name (what finger/pinky show)
 
-# Create dev user (password 'dev') matching host UID/GID where possible.
-# Falls back cleanly when the host GID/UID collides with an existing one.
-RUN (addgroup -g "${HOST_GID}" dev 2>/dev/null || addgroup dev) \
-    && (adduser -D -u "${HOST_UID}" -G dev -s /bin/bash dev 2>/dev/null \
-        || adduser -D -G dev -s /bin/bash dev) \
-    && echo 'dev:dev' | chpasswd \
-    && addgroup dev wheel \
-    && addgroup dev root \
+# Create the login user (password 'dev') matching host UID/GID where possible.
+# Name and home come from DEV_USER; DEV_FULLNAME is the GECOS. Falls back cleanly
+# when the host GID/UID collides with an existing one.
+RUN (addgroup -g "${HOST_GID}" "${DEV_USER}" 2>/dev/null || addgroup "${DEV_USER}") \
+    && (adduser -D -u "${HOST_UID}" -G "${DEV_USER}" -g "${DEV_FULLNAME}" -s /bin/bash "${DEV_USER}" 2>/dev/null \
+        || adduser -D -G "${DEV_USER}" -g "${DEV_FULLNAME}" -s /bin/bash "${DEV_USER}") \
+    && echo "${DEV_USER}:dev" | chpasswd \
+    && addgroup "${DEV_USER}" wheel \
+    && addgroup "${DEV_USER}" root \
     && sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
 # Copy host user's git config (passed as build arg)
-RUN if [ -n "$GITCONFIG" ]; then echo "$GITCONFIG" > /home/dev/.gitconfig && chown dev:dev /home/dev/.gitconfig; fi
+RUN if [ -n "$GITCONFIG" ]; then echo "$GITCONFIG" > /home/${DEV_USER}/.gitconfig && chown ${DEV_USER}:${DEV_USER} /home/${DEV_USER}/.gitconfig; fi
 
 # Create host path directory structure (as root for arbitrary paths like /Users/...)
-RUN mkdir -p "${HOST_PROJECT_PATH}" && chown -R dev:dev "$(echo ${HOST_PROJECT_PATH} | cut -d'/' -f1-2)"
+RUN mkdir -p "${HOST_PROJECT_PATH}" && chown -R ${DEV_USER}:${DEV_USER} "$(echo ${HOST_PROJECT_PATH} | cut -d'/' -f1-2)"
 
-# Switch to dev user for remaining setup
-USER dev
-WORKDIR /home/dev
+# Entrypoint to inject Claude config from env vars. Written as root to a fixed path
+# so the ENTRYPOINT is independent of the user/home; ~ resolves to the login user's
+# home at runtime, since the container's main process runs as ${DEV_USER}.
+RUN <<'SCRIPT' cat > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+#!/bin/bash
+if [ -n "$CLAUDE_CODE_CREDENTIALS" ]; then
+  mkdir -p ~/.claude
+  echo "$CLAUDE_CODE_CREDENTIALS" > ~/.claude/.credentials.json
+fi
+if [ -n "$CLAUDE_JSON" ]; then
+  echo "$CLAUDE_JSON" > ~/.claude.json
+fi
+exec "$@"
+SCRIPT
 
-RUN mkdir -p /home/dev/.local/bin
+# Switch to the login user for remaining setup
+USER ${DEV_USER}
+WORKDIR /home/${DEV_USER}
 
-# Configure shell: PATH, aliases
-RUN echo 'export PATH="/home/dev/.local/bin:$PATH"' >> ~/.bashrc \
+RUN mkdir -p /home/${DEV_USER}/.local/bin
+
+# Configure shell: PATH, aliases ($HOME keeps this home-independent)
+RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc \
     && echo "alias claude!='claude --dangerously-skip-permissions --thinking-display summarized'" >> ~/.bashrc \
     && echo "alias ll='ls -la'" >> ~/.bashrc
 
@@ -1077,24 +1188,11 @@ RUN echo 'set -g mouse on' > ~/.tmux.conf \
     && echo 'bind m set -g mouse \\; display "Mouse: #{?mouse,ON,OFF}"' >> ~/.tmux.conf
 
 # No-op afplay stub (macOS command not available in Linux)
-RUN echo '#!/bin/sh' > /home/dev/.local/bin/afplay \
-    && echo 'exit 0' >> /home/dev/.local/bin/afplay \
-    && chmod +x /home/dev/.local/bin/afplay
+RUN echo '#!/bin/sh' > /home/${DEV_USER}/.local/bin/afplay \
+    && echo 'exit 0' >> /home/${DEV_USER}/.local/bin/afplay \
+    && chmod +x /home/${DEV_USER}/.local/bin/afplay
 
-# Entrypoint script to inject Claude config from env vars
-RUN <<'SCRIPT' cat > /home/dev/.local/bin/entrypoint.sh && chmod +x /home/dev/.local/bin/entrypoint.sh
-#!/bin/bash
-if [ -n "$CLAUDE_CODE_CREDENTIALS" ]; then
-  mkdir -p ~/.claude
-  echo "$CLAUDE_CODE_CREDENTIALS" > ~/.claude/.credentials.json
-fi
-if [ -n "$CLAUDE_JSON" ]; then
-  echo "$CLAUDE_JSON" > ~/.claude.json
-fi
-exec "$@"
-SCRIPT
-
-ENTRYPOINT ["/home/dev/.local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # Re-declare ARG after USER switch (ARGs don't persist)
 ARG HOST_PROJECT_PATH="/home/dev/src"

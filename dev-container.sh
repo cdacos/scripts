@@ -9,7 +9,7 @@
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="2.1"
+VERSION="2.2"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
@@ -73,6 +73,13 @@ Agent-bus token flow (on first create, if <name>/.env has no AGENT_BUS_TOKEN):
   (s)kip     no bus identity
   On enter/generate the token is written to <name>/.env and a paste-ready
   config/agents.json fragment (with its sha256) is printed for the bus operator.
+
+Persona flow (on first create, optional):
+  After seeding the claude dir you can give the agent a persona. Enter a name,
+  then (g)enerate a bio with `claude -p` (sonnet), (w)rite your own in $EDITOR,
+  or (s)kip. The bio is saved to <name>/claude/persona.md and imported from the
+  container's CLAUDE.md via an '@persona.md' line (the seeded CLAUDE.md is left
+  otherwise untouched). Skipped or empty personas write nothing.
 
 Isolation (be honest):
   The container sees ONLY the target folder (at the same absolute path) and its own
@@ -326,6 +333,104 @@ EOF
 	printf '  "%s": { "token_sha256": "%s", "publish": ["*"], "subscribe": ["*"] }\n\n' "$name" "$hash"
 }
 
+# Draft a persona bio for a name with `claude -p` (sonnet). Prints only the bio to
+# stdout; the status line goes to stderr so it is not captured by $(...).
+generate_persona() {
+	pname="$1"
+	info "Drafting a bio for '$pname' with claude (sonnet)..." >&2
+	claude --model sonnet -p "Write a short second-person persona (2-3 sentences) for an AI software-engineering agent named \"$pname\". Establish that it is a careful, methodical coding agent, but give it a small playful character quirk that fits the name. Begin with 'Your name is $pname.' Output only the persona text - no preamble, no surrounding quotes." 2>/dev/null || true
+}
+
+# Open $EDITOR on the given seed text (via the tty, since we run inside $(...)) and
+# echo the edited result to stdout.
+edit_text() {
+	tmpf=$(mktemp)
+	printf '%s\n' "$1" >"$tmpf"
+	"${EDITOR:-vi}" "$tmpf" </dev/tty >/dev/tty 2>&1 || true
+	cat "$tmpf"
+	rm -f "$tmpf"
+}
+
+# Prompt (first create only) for an optional persona, written to <claude>/persona.md
+# and imported from the seeded CLAUDE.md via an '@persona.md' line. The bio can be
+# drafted with claude, hand-written in $EDITOR, or skipped. Never overwrites an
+# existing persona and never rewrites the rest of CLAUDE.md.
+ensure_persona() {
+	name="$1"
+	claude_dir="$2"
+	persona_file="$claude_dir/persona.md"
+
+	[ -f "$persona_file" ] && return 0
+
+	printf "\n"
+	printf "${CYAN}Give '%s' a persona? It is written to the container's CLAUDE.md so the agent knows who it is.${NC}\n" "$name"
+	printf "Persona name (blank to skip): "
+	read -r persona_name
+	[ -z "$persona_name" ] && {
+		info "No persona."
+		return 0
+	}
+
+	have_claude=false
+	command -v claude >/dev/null 2>&1 && have_claude=true
+
+	if [ "$have_claude" = true ]; then
+		printf "  (g)enerate a bio with claude   (w)rite my own   (s)kip\n"
+		printf "Choice [g/w/s]: "
+	else
+		printf "  (w)rite my own   (s)kip   (claude not found, generate unavailable)\n"
+		printf "Choice [w/s]: "
+	fi
+	read -r choice
+
+	bio=""
+	case "$choice" in
+	g | G)
+		[ "$have_claude" = true ] || {
+			info "claude not found; skipping."
+			return 0
+		}
+		bio=$(generate_persona "$persona_name")
+		while :; do
+			printf "\n${GREEN}%s${NC}\n\n" "$bio"
+			printf "(a)ccept / (r)egenerate / (e)dit / (s)kip: "
+			read -r act
+			case "$act" in
+			a | A | "") break ;;
+			r | R) bio=$(generate_persona "$persona_name") ;;
+			e | E) bio=$(edit_text "$bio") ;;
+			s | S)
+				info "Skipping persona."
+				return 0
+				;;
+			esac
+		done
+		;;
+	w | W)
+		bio=$(edit_text "Your name is $persona_name. ")
+		;;
+	*)
+		info "Skipping persona."
+		return 0
+		;;
+	esac
+
+	# Trim to check for emptiness (a lone seed/whitespace counts as skip).
+	if [ -z "$(printf '%s' "$bio" | tr -d '[:space:]')" ]; then
+		info "Empty persona, skipping."
+		return 0
+	fi
+
+	printf '%s\n' "$bio" >"$persona_file"
+
+	# Import the persona from CLAUDE.md (append the line once; never rewrite the file).
+	claude_md="$claude_dir/CLAUDE.md"
+	if ! { [ -f "$claude_md" ] && grep -qxF '@persona.md' "$claude_md"; }; then
+		printf '\n@persona.md\n' >>"$claude_md"
+	fi
+	success "Persona written to $persona_file"
+}
+
 # Build the image. dockerfile + context differ by resolution; project_path drives path parity.
 build_image() {
 	image="$1"
@@ -469,6 +574,7 @@ cmd_up() {
 	warn_git "$folder"
 	[ "$status" = "none" ] && ensure_token "$name" "$name_dir" "$name_env"
 	seed_claude "$name_dir/claude"
+	[ "$status" = "none" ] && ensure_persona "$name" "$name_dir/claude"
 	build_image "$image" "$dockerfile" "$context" "$folder"
 	run_container "$name" "$port" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile"
 

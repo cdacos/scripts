@@ -9,37 +9,53 @@
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="2.2"
+VERSION="3.0"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
 
 show_help() {
 	cat <<'EOF'
-Usage: dev! [name] [folder] [--docker]
+Usage: dev! [name] [folder] [--save|--only] [--docker]
        dev! kill <name>
        dev! completion bash|zsh
        dev! -h | --help
        dev! --version
 
-Launches a named Docker dev container that mounts ONLY the given folder (rw) plus
-its own persistent state. Free of git repos and worktrees.
+Launches a named Docker dev container. A container remembers every folder you
+SAVE to it and mounts them all (rw), at their real absolute paths, plus its own
+persistent state. Free of git repos and worktrees.
 
 Commands:
-  (no args)                List all containers: NAME, PORT, STATUS, FOLDER
-  <name> [folder]          Create/start container for folder (default: current dir)
+  (no args)                List all containers: NAME, PORT, STATUS, FOLDERS
+  <name> [folder]          Create/start container; ask whether to save the folder
+  <name> [folder] --save   Add folder to the set, mount the whole set
+  <name> [folder] --only   Mount JUST this folder, don't remember it
   <name> ... --docker      Also mount /var/run/docker.sock (see Isolation below)
   kill <name>              Stop+remove container and image, delete its state dir
   completion bash|zsh      Output shell completion code
   -h, --help               Show this help
   --version                Print version and exit
 
+Mount set (accumulated folders):
+  Each container keeps a set of remembered folders as symlinks under
+  <STATE_HOME>/<name>/mounts/. --save adds the folder to the set; a bare
+  invocation asks (save/only) unless the folder is already saved. --only mounts
+  just the given folder for this run and remembers nothing. Every save-mode start
+  mounts the WHOLE set; the folder you pass is the working dir. Folders deleted on
+  the host are skipped with a warning. Remove one from the set by hand:
+      rm <STATE_HOME>/<name>/mounts/<link>
+  Docker fixes bind mounts at create time, so changing the set (saving a new
+  folder, or --only) takes effect on the next (re)create - a ~1-2s rebuild-free
+  docker rm + run; nothing durable is lost.
+
 Start semantics:
-  running   -> report and quit (attach with: docker exec -it -u dev dev-<name> bash)
-  stopped   -> remove + recreate bound to the folder from THIS invocation (reuses
-               the stored port and bus token), then attach
+  running   -> if the mount set is unchanged, report and quit; otherwise offer to
+               recreate to apply the change (attach: docker exec -it -u dev dev-<name> bash)
+  stopped   -> recreate with the resolved mount set (reuses the stored port and bus
+               token), then attach
   none      -> confirm, run the token flow, build, run, attach
-  Folder is not sticky: each (re)create binds to the folder you pass that time.
+  Folder default is the current dir. The working dir is always the folder you pass.
 
 State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
   <STATE_HOME>/.env          shared KEY=value env (AGENT_BUS_URL, GITHUB_USERNAME,
@@ -49,7 +65,9 @@ State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
                              bind-mounted rw at /home/dev/Dockerfile so the container
                              can edit it - takes effect on the next recreate)
   <STATE_HOME>/<name>/port   host port (plain text; deliberately NOT in .env)
-  <STATE_HOME>/<name>/folder last folder path (for listing)
+  <STATE_HOME>/<name>/mounts saved folders, one symlink each (name = abs path with
+                             '/' as backtick, target = the folder). rm one to forget it.
+  <STATE_HOME>/<name>/folder last folder path (working-dir hint / legacy fallback)
   <STATE_HOME>/<name>/claude persistent /home/dev/.claude (seeded once from ~/.claude)
 
 Env files:
@@ -82,18 +100,23 @@ Persona flow (on first create, optional):
   otherwise untouched). Skipped or empty personas write nothing.
 
 Isolation (be honest):
-  The container sees ONLY the target folder (at the same absolute path) and its own
-  claude dir. It does NOT get the rest of the host filesystem. Network is NOT
-  isolated. --docker mounts the host Docker socket, which is root-equivalent access
-  to the host (on macOS: the whole Docker VM and every file-shared path) - use only
-  when the container genuinely needs to spawn containers.
+  The container sees ONLY the folders you have saved to it (or, with --only, the
+  single folder you passed), each at its real absolute path, plus its own claude
+  dir. It does NOT get the rest of the host filesystem - but note the saved set
+  grows every time you --save a new folder, so a long-lived container's reach is
+  whatever you have accumulated (inspect it with `ls -l <STATE_HOME>/<name>/mounts`).
+  Network is NOT isolated. --docker mounts the host Docker socket, which is
+  root-equivalent access to the host (on macOS: the whole Docker VM and every
+  file-shared path) - use only when the container genuinely needs to spawn containers.
 
 Examples:
-  dev! api ~/src/api        # container 'dev-api' mounting ~/src/api
-  dev! scratch              # container 'dev-scratch' mounting the current dir
-  dev! ci . --docker        # mount current dir + docker.sock
-  dev!                      # list all containers
-  dev! kill api             # tear down 'dev-api' and delete its state
+  dev! api ~/src/api --save   # remember ~/src/api and mount the set
+  dev! api ~/src/lib --save   # now mounts BOTH ~/src/api and ~/src/lib
+  dev! api ~/scratch --only   # mount just ~/scratch this run, remember nothing
+  dev! scratch                # current dir; asks whether to save it
+  dev! ci . --save --docker   # save current dir + mount docker.sock
+  dev!                        # list all containers
+  dev! kill api               # tear down 'dev-api' and delete its state
 EOF
 }
 
@@ -157,6 +180,105 @@ token_sha256() {
 	else
 		printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'
 	fi
+}
+
+# --- Mount set (accumulated folders) ------------------------------------------
+# A container remembers folders as symlinks under <name>/mounts/. The symlink
+# NAME is the absolute path with '/' encoded as backtick (\140), so names are
+# unique by construction (no basename collisions) and the mount path is decoded
+# straight from the name. The symlink TARGET is the real folder, giving a free
+# existence check ([ -e ]) and human-readable `ls -l`. Prune a folder with a
+# plain `rm mounts/<link>`.
+
+encode_path() { printf '%s' "$1" | tr '/' '\140'; }
+decode_path() { printf '%s' "$1" | tr '\140' '/'; }
+
+# Add a folder to a container's mount set (idempotent).
+add_mount() {
+	amd="$1"
+	afolder="$2"
+	mkdir -p "$amd"
+	ln -sfn "$afolder" "$amd/$(encode_path "$afolder")"
+}
+
+# Count live+dead symlinks in a mount dir.
+count_mounts() {
+	cm="$1"
+	n=0
+	[ -d "$cm" ] || {
+		echo 0
+		return
+	}
+	for link in "$cm"/*; do
+		[ -L "$link" ] && n=$((n + 1))
+	done
+	echo "$n"
+}
+
+# Echo the first mount target (decoded), if any.
+first_mount() {
+	[ -d "$1" ] || return 0
+	for link in "$1"/*; do
+		[ -L "$link" ] || continue
+		decode_path "$(basename "$link")"
+		return 0
+	done
+}
+
+# Echo the folders to mount this run, one absolute path per line.
+#   mode=only -> just this folder (the set is ignored, nothing saved).
+#   otherwise -> every live folder in the set. Dead symlinks (folder deleted on
+#   the host) are skipped with a warning to stderr. An empty/all-dead set falls
+#   back to this invocation's folder so a container never launches with no mount.
+build_mount_list() {
+	bmode="$1"
+	bfolder="$2"
+	bmd="$3"
+	if [ "$bmode" = only ]; then
+		printf '%s\n' "$bfolder"
+		return 0
+	fi
+	found=false
+	if [ -d "$bmd" ]; then
+		for link in "$bmd"/*; do
+			[ -L "$link" ] || continue
+			target=$(decode_path "$(basename "$link")")
+			if [ -e "$link" ]; then
+				printf '%s\n' "$target"
+				found=true
+			else
+				printf "${YELLOW}Warning: saved folder %s no longer exists; skipping (rm %s to forget it).${NC}\n" "$target" "$link" >&2
+			fi
+		done
+	fi
+	[ "$found" = false ] && printf '%s\n' "$bfolder"
+	return 0
+}
+
+# One-time migration: a container from the old single-folder model has a `folder`
+# marker but no mounts/ dir. Seed the set from it so it keeps working.
+migrate_legacy_folder() {
+	mld="$1"
+	if [ ! -d "$mld/mounts" ] && [ -f "$mld/folder" ]; then
+		old=$(cat "$mld/folder" 2>/dev/null)
+		[ -n "$old" ] && [ -d "$old" ] && add_mount "$mld/mounts" "$old"
+	fi
+}
+
+# Sorted list of a running container's folder-mount sources (excludes the
+# container's own claude dir / Dockerfile under name_dir, and docker.sock).
+current_folder_mounts() {
+	cfm_container="$1"
+	cfm_name_dir="$2"
+	docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$cfm_container" 2>/dev/null |
+		while IFS= read -r src; do
+			[ -n "$src" ] || continue
+			case "$src" in
+			"$cfm_name_dir"/*) continue ;;
+			/var/run/docker.sock) continue ;;
+			*) echo "$src" ;;
+			esac
+		done | sort -u
 }
 
 # Source each env file that exists (auto-export), shared first so per-name wins.
@@ -266,15 +388,24 @@ seed_claude() {
 # to the daemon. Written once; delete it to un-ignore.
 ensure_dockerignore() {
 	di="$1/.dockerignore"
-	[ -f "$di" ] && return 0
-	cat >"$di" <<'EOF'
+	if [ ! -f "$di" ]; then
+		cat >"$di" <<'EOF'
 # Auto-generated by dev!. Keeps the build context small and secret-free.
 # The Dockerfile lives in this dir alongside container state; ignore the state.
 .env
 port
 folder
 claude
+mounts
+.build-sig
 EOF
+		return 0
+	fi
+	# Upgrade older ignore files (mounts/ can contain symlinks to large host
+	# folders; .build-sig is the build cache marker - neither belongs in context).
+	for entry in mounts .build-sig; do
+		grep -qxF "$entry" "$di" || printf '%s\n' "$entry" >>"$di"
+	done
 }
 
 # Prompt for and persist a bus token if <name>/.env lacks a non-empty one.
@@ -431,12 +562,35 @@ ensure_persona() {
 	success "Persona written to $persona_file"
 }
 
+# A signature of everything that affects the built image: the Dockerfile plus the
+# build args passed to it. Stored after a successful build so unchanged recreates
+# can skip `docker build` entirely (recreates are then just docker rm + run).
+build_signature() {
+	sig_content=$(
+		cat "$1"
+		printf '\n%s|%s|%s|%s|%s|%s' \
+			"${GITCONFIG:-}" "${GITHUB_USERNAME:-}" "$2" "$(id -u)" "$(id -g)" \
+			"$([ -n "${GITHUB_TOKEN_DOTFILES:-}" ] && echo 1)"
+	)
+	token_sha256 "$sig_content"
+}
+
 # Build the image. dockerfile + context differ by resolution; project_path drives path parity.
 build_image() {
 	image="$1"
 	dockerfile="$2"
 	context="$3"
 	project_path="$4"
+
+	# Skip the build when the image already exists and nothing that feeds it has
+	# changed (same Dockerfile + same build args). Keeps folder-add recreates fast.
+	sig=$(build_signature "$dockerfile" "$project_path")
+	sig_file="$context/.build-sig"
+	if docker image inspect "$image" >/dev/null 2>&1 &&
+		[ -f "$sig_file" ] && [ "$(cat "$sig_file")" = "$sig" ]; then
+		info "Image '$image' is up to date (skipping build)."
+		return 0
+	fi
 
 	token_file=""
 	if [ -n "${GITHUB_TOKEN_DOTFILES:-}" ]; then
@@ -457,19 +611,23 @@ build_image() {
 	docker "$@"
 
 	[ -n "$token_file" ] && rm -f "$token_file" || true
+	printf '%s' "$sig" >"$sig_file"
 }
 
-# Run the container. env files are added only if present (docker errors on a missing one).
+# Run the container. env files are added only if present (docker errors on a
+# missing one). Every folder in mount_list (newline-separated) is bind-mounted at
+# the same absolute path; cwd is this invocation's folder.
 run_container() {
 	name="$1"
 	port="$2"
-	folder="$3"
+	cwd="$3"
 	image="$4"
 	claude_dir="$5"
 	docker_sock="$6"
 	shared_env="$7"
 	name_env="$8"
 	dockerfile="$9"
+	mount_list="${10}"
 
 	claude_creds=$(get_claude_credentials)
 	claude_json=$(get_claude_json)
@@ -483,11 +641,19 @@ run_container() {
 	[ -f "$shared_env" ] && set -- "$@" --env-file "$shared_env"
 	[ -f "$name_env" ] && set -- "$@" --env-file "$name_env"
 
+	oldifs=$IFS
+	IFS='
+'
+	for m in $mount_list; do
+		[ -n "$m" ] || continue
+		set -- "$@" -v "${m}:${m}"
+	done
+	IFS=$oldifs
+
 	set -- "$@" \
-		-v "${folder}:${folder}" \
 		-v "${claude_dir}:/home/dev/.claude" \
 		-v "${dockerfile}:/home/dev/Dockerfile" \
-		-w "${folder}"
+		-w "${cwd}"
 
 	[ "$docker_sock" = "true" ] && set -- "$@" -v /var/run/docker.sock:/var/run/docker.sock
 
@@ -502,11 +668,39 @@ attach_container() {
 	docker exec -it -e TERM=xterm-256color -e COLORTERM=truecolor -u dev "dev-$1" bash
 }
 
-# Create or start a container for a folder.
+# Prompt for the mount mode (save vs only) when no flag was given. Echoes the
+# chosen mode to stdout; prompts/info go to stderr. Exits on cancel.
+prompt_mode() {
+	pm_folder="$1"
+	pm_mounts_dir="$2"
+	pm_nset=$(count_mounts "$pm_mounts_dir")
+	printf "\n" >&2
+	printf "${CYAN}Mount %s:${NC}\n" "$pm_folder" >&2
+	if [ "$pm_nset" -gt 0 ]; then
+		printf "  (s)ave  remember it and mount the whole set (%s already saved)\n" "$pm_nset" >&2
+	else
+		printf "  (s)ave  remember it and mount the whole set\n" >&2
+	fi
+	printf "  (o)nly  just this folder, don't remember it\n" >&2
+	printf "  (c)ancel\n" >&2
+	printf "Choice [s/o/c]: " >&2
+	read -r pm_choice
+	case "$pm_choice" in
+	s | S) echo save ;;
+	o | O) echo only ;;
+	*)
+		info "Aborted." >&2
+		exit 0
+		;;
+	esac
+}
+
+# Create or start a container. mode is "save", "only", or "" (prompt if it matters).
 cmd_up() {
 	name=$(slugify "$1")
 	folder_arg="${2:-.}"
 	docker_sock="$3"
+	mode="$4"
 	[ -n "$name" ] || error "Invalid name"
 
 	container="dev-$name"
@@ -514,34 +708,70 @@ cmd_up() {
 	name_dir="$STATE_HOME/$name"
 	name_env="$name_dir/.env"
 	shared_env="$STATE_HOME/.env"
-
-	status=$(get_container_status "$container")
-	if [ "$status" = "running" ]; then
-		info "Container '$container' is already running."
-		printf "Port ${YELLOW}%s${NC} → container:8000\n" "$(cat "$name_dir/port" 2>/dev/null || echo '?')"
-		printf "Attach with: ${CYAN}docker exec -it -u dev %s bash${NC}\n" "$container"
-		exit 0
-	fi
-
-	folder=$(resolve_folder "$folder_arg")
-
-	ensure_shared_env
-	load_env_files "$shared_env" "$name_env"
-
-	# Each container owns its Dockerfile under its state dir (context = that dir); it
-	# is written on first create and thereafter editable by the container via the
-	# /home/dev/Dockerfile bind mount. The target folder's own Dockerfiles are ignored.
-	# Only paths here - the actual write happens past the confirm gate below.
+	mounts_dir="$name_dir/mounts"
 	dockerfile="$name_dir/Dockerfile"
 	context="$name_dir"
 
+	folder=$(resolve_folder "$folder_arg")
+	migrate_legacy_folder "$name_dir"
+
+	# Resolve the mode. If no flag: an already-saved folder needs no decision
+	# (just start the set); anything else is ambiguous, so ask.
+	if [ -z "$mode" ]; then
+		if [ -L "$mounts_dir/$(encode_path "$folder")" ]; then
+			mode=save
+		else
+			mode=$(prompt_mode "$folder" "$mounts_dir")
+		fi
+	fi
+
+	ensure_shared_env
+	load_env_files "$shared_env" "$name_env"
 	port=$(allocate_port "$name_dir")
 
+	status=$(get_container_status "$container")
+
+	# Running: compare the running mount set to what this invocation wants. Same ->
+	# just report. Different -> the change (a newly saved folder, or --only) needs a
+	# recreate to apply, since Docker fixes bind mounts at create time.
+	if [ "$status" = "running" ]; then
+		[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
+		desired=$(build_mount_list "$mode" "$folder" "$mounts_dir" 2>/dev/null | sort -u)
+		current=$(current_folder_mounts "$container" "$name_dir")
+		if [ "$desired" = "$current" ]; then
+			info "Container '$container' is already running."
+			printf "Port ${YELLOW}%s${NC} → container:8000\n" "$(cat "$name_dir/port" 2>/dev/null || echo '?')"
+			printf "Attach with: ${CYAN}docker exec -it -u dev %s bash${NC}\n" "$container"
+			exit 0
+		fi
+		printf "\n"
+		info "Mount set differs from the running '$container'. It will be:"
+		printf '%s\n' "$desired" | while read -r m; do [ -n "$m" ] && printf "  ${YELLOW}%s${NC}\n" "$m"; done
+		printf "\nRecreate '%s' now to apply? [y/n] " "$container"
+		read -r ans
+		case "$ans" in
+		[Yy] | [Yy][Ee][Ss]) ;;
+		*)
+			info "Left running; the change applies on the next recreate."
+			exit 0
+			;;
+		esac
+		info "Stopping '$container'..."
+		docker stop "$container" >/dev/null
+		docker rm "$container" >/dev/null
+		status=stopped
+	fi
+
+	# First create: confirm before writing any state (an abort leaves nothing behind).
 	if [ "$status" = "none" ]; then
 		printf "\n"
 		info "Will create:"
 		printf "  Name:       ${YELLOW}%s${NC}\n" "$name"
-		printf "  Folder:     ${YELLOW}%s${NC}\n" "$folder"
+		if [ "$mode" = only ]; then
+			printf "  Folder:     ${YELLOW}%s${NC} (only - not saved)\n" "$folder"
+		else
+			printf "  Folder:     ${YELLOW}%s${NC} (saved to the set)\n" "$folder"
+		fi
 		printf "  Container:  ${YELLOW}%s${NC}\n" "$container"
 		printf "  Port:       ${YELLOW}%s${NC} → 8000\n" "$port"
 		printf "  Dockerfile: ${YELLOW}%s${NC}\n" "$dockerfile"
@@ -557,13 +787,14 @@ cmd_up() {
 		esac
 		printf "\n"
 	else
-		info "Recreating stopped container '$container' bound to $folder..."
-		docker rm "$container" >/dev/null
+		info "Recreating stopped container '$container'..."
+		docker rm "$container" >/dev/null 2>&1 || true
 	fi
 
 	mkdir -p "$name_dir"
 	printf '%s' "$port" >"$name_dir/port"
 	printf '%s' "$folder" >"$name_dir/folder"
+	[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
 
 	if [ ! -f "$dockerfile" ]; then
 		write_default_dockerfile "$dockerfile"
@@ -571,12 +802,16 @@ cmd_up() {
 	fi
 	ensure_dockerignore "$name_dir"
 
-	warn_git "$folder"
+	# Resolve the folders to mount (warnings for any deleted saved folder go to the
+	# user here), warn about git for each, then build + run.
+	mount_list=$(build_mount_list "$mode" "$folder" "$mounts_dir")
+	printf '%s\n' "$mount_list" | while read -r m; do [ -n "$m" ] && warn_git "$m"; done
+
 	[ "$status" = "none" ] && ensure_token "$name" "$name_dir" "$name_env"
 	seed_claude "$name_dir/claude"
 	[ "$status" = "none" ] && ensure_persona "$name" "$name_dir/claude"
 	build_image "$image" "$dockerfile" "$context" "$folder"
-	run_container "$name" "$port" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile"
+	run_container "$name" "$port" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list"
 
 	printf "\n"
 	success "Container ready!"
@@ -591,8 +826,8 @@ cmd_list() {
 		return 0
 	fi
 
-	printf "%-16s %-8s %-9s %s\n" "NAME" "PORT" "STATUS" "FOLDER"
-	printf "%-16s %-8s %-9s %s\n" "----------------" "--------" "---------" "------"
+	printf "%-16s %-8s %-9s %s\n" "NAME" "PORT" "STATUS" "FOLDERS"
+	printf "%-16s %-8s %-9s %s\n" "----------------" "--------" "---------" "-------"
 
 	found=false
 	for d in "$STATE_HOME"/*/; do
@@ -600,7 +835,14 @@ cmd_list() {
 		found=true
 		name=$(basename "$d")
 		port=$(cat "$d/port" 2>/dev/null || echo "?")
-		folder=$(cat "$d/folder" 2>/dev/null || echo "?")
+		n=$(count_mounts "$d/mounts")
+		if [ "$n" -eq 0 ]; then
+			folder=$(cat "$d/folder" 2>/dev/null || echo "?")
+		elif [ "$n" -eq 1 ]; then
+			folder=$(first_mount "$d/mounts")
+		else
+			folder="[$n] $(first_mount "$d/mounts") +$((n - 1))"
+		fi
 		status=$(get_container_status "dev-$name")
 		case "$status" in
 		running) printf "%-16s %-8s ${GREEN}%-9s${NC} %s\n" "$name" "$port" "running" "$folder" ;;
@@ -843,14 +1085,23 @@ main() {
 		shift
 		folder_arg="."
 		docker_sock=false
+		mode=""
 		for arg in "$@"; do
 			case "$arg" in
 			--docker) docker_sock=true ;;
+			--save)
+				[ -n "$mode" ] && error "--save and --only are mutually exclusive"
+				mode=save
+				;;
+			--only)
+				[ -n "$mode" ] && error "--save and --only are mutually exclusive"
+				mode=only
+				;;
 			-*) error "Unknown option: $arg" ;;
 			*) folder_arg="$arg" ;;
 			esac
 		done
-		cmd_up "$name" "$folder_arg" "$docker_sock"
+		cmd_up "$name" "$folder_arg" "$docker_sock" "$mode"
 		;;
 	esac
 }

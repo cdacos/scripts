@@ -1475,7 +1475,7 @@ RUN apk add --no-cache \
     github-cli \
     tmux \
     vim \
-    openssh-keygen
+    openssh-client
 
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8

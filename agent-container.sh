@@ -10,7 +10,7 @@
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="1.0"
+VERSION="1.1"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
@@ -1474,7 +1474,8 @@ RUN apk add --no-cache \
     docker-cli \
     github-cli \
     tmux \
-    vim
+    vim \
+    openssh-keygen
 
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
@@ -1490,14 +1491,18 @@ ARG AGENT_FULLNAME=Agent   # GECOS display name (what finger/pinky show)
 
 # Create the login user (password 'agent') matching host UID/GID where possible.
 # Name and home come from AGENT_USER; AGENT_FULLNAME is the GECOS. Falls back cleanly
-# when the host GID/UID collides with an existing one.
+# when the host GID/UID collides with an existing one. A NOPASSWD sudoers.d drop-in
+# gives the user passwordless sudo (no security loss — the password is the fixed
+# literal 'agent' anyway); visudo -cf validates the drop-in at build time.
 RUN (addgroup -g "${HOST_GID}" "${AGENT_USER}" 2>/dev/null || addgroup "${AGENT_USER}") \
     && (adduser -D -u "${HOST_UID}" -G "${AGENT_USER}" -g "${AGENT_FULLNAME}" -s /bin/bash "${AGENT_USER}" 2>/dev/null \
         || adduser -D -G "${AGENT_USER}" -g "${AGENT_FULLNAME}" -s /bin/bash "${AGENT_USER}") \
     && echo "${AGENT_USER}:agent" | chpasswd \
     && addgroup "${AGENT_USER}" wheel \
     && addgroup "${AGENT_USER}" root \
-    && sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+    && echo "${AGENT_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/"${AGENT_USER}" \
+    && chmod 0440 /etc/sudoers.d/"${AGENT_USER}" \
+    && visudo -cf /etc/sudoers.d/"${AGENT_USER}"
 
 # Copy host user's git config (passed as build arg)
 RUN if [ -n "$GITCONFIG" ]; then echo "$GITCONFIG" > /home/${AGENT_USER}/.gitconfig && chown ${AGENT_USER}:${AGENT_USER} /home/${AGENT_USER}/.gitconfig; fi

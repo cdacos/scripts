@@ -1210,7 +1210,7 @@ cmd_up() {
 		fi
 		printf "\n"
 		info "Config differs from the running '$container'. It will have:"
-		printf '%s\n' "$desired" | while read -r m; do [ -n "$m" ] && printf "  mount ${YELLOW}%s${NC}\n" "$m"; done
+		printf '%s\n' "$desired" | while read -r m; do [ -n "$m" ] && printf "  mount ${YELLOW}%s${NC}\n" "$m"; done || true
 		printf "  ports ${YELLOW}%s${NC}\n" "$(format_ports "$desired_ports")"
 		printf "\nRecreate '%s' now to apply? [y/n] " "$container"
 		read -r ans
@@ -1323,7 +1323,9 @@ cmd_up() {
 	# Resolve the folders to mount (warnings for any deleted saved folder go to the
 	# user here), warn about git for each, then build + run.
 	mount_list=$(build_mount_list "$mode" "$folder" "$mounts_dir")
-	printf '%s\n' "$mount_list" | while read -r m; do [ -n "$m" ] && warn_git "$m"; done
+	# `|| true`: an empty mount set makes the loop body's last test false, which would
+	# otherwise trip `set -e` on this pipeline.
+	printf '%s\n' "$mount_list" | while read -r m; do [ -n "$m" ] && warn_git "$m"; done || true
 
 	[ "$first_create" = true ] && ensure_token "$name" "$name_dir" "$name_env"
 	seed_claude "$name_dir/claude"

@@ -4,23 +4,23 @@ Shared developer utility scripts.
 
 ## Scripts
 
-### `dev-container.sh` (aka `dev!`)
+### `agent-container.sh` (aka `agent`)
 
-Folder-based Docker dev container launcher. `dev! <name> [folder]` starts a named container that mounts **only** the given folder (default: current dir) plus its own persistent state under `~/.local/dev-container/<name>/` (bus token, Claude home, port) — nothing else on the host. `docker.sock` is not mounted unless you pass `--docker`.
+Folder-based Docker agent container launcher. `agent! <name> [folder]` starts a named container that mounts **only** the given folder (default: current dir) plus its own persistent state under `~/.local/agent-container/<name>/` (bus token, Claude home, port) — nothing else on the host. `docker.sock` is not mounted unless you pass `--docker`.
 
 ```sh
-dev! api ~/src/api        # Create/start container 'dev-api' mounting ~/src/api
-dev! scratch              # Container 'dev-scratch' on the current dir
-dev! ci . --docker        # Also mount the host Docker socket (root-equivalent — opt-in)
-dev!                      # List all containers (NAME, PORT, STATUS, FOLDER)
-dev! kill api             # Tear down 'dev-api' and delete its state
+agent! api ~/src/api        # Create/start container 'agent-api' mounting ~/src/api
+agent! scratch              # Container 'agent-scratch' on the current dir
+agent! ci . --docker        # Also mount the host Docker socket (root-equivalent — opt-in)
+agent!                      # List all containers (NAME, PORT, STATUS, FOLDER)
+agent! kill api             # Tear down 'agent-api' and delete its state
 ```
 
-Each container owns its own Dockerfile at `~/.local/dev-container/<name>/Dockerfile`, written from a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux) on first create. It's bind-mounted read-write at `/home/dev/Dockerfile`, so the container can edit its own build recipe — the change takes effect on the next `dev! <name>` recreate. The target folder's own Dockerfiles are ignored; copy from them by hand if you want.
+Each container owns its own Dockerfile at `~/.local/agent-container/<name>/Dockerfile`, written from a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux) on first create. It's bind-mounted read-write at `~/Dockerfile`, so the container can edit its own build recipe — the change takes effect on the next `agent! <name>` recreate. The target folder's own Dockerfiles are ignored; copy from them by hand if you want.
 
-### `dev-container-per-repo.sh`
+### `dev-container.sh`
 
-The previous, git-worktree-based `dev!`. Pairs each branch with a worktree + container under `../{repo}.worktrees/{port}/{branch}/`, mounting the whole repo. Kept for repo/worktree-centric workflows; use `dev-container.sh` (above) for the newer folder-based model.
+The git-worktree-based `dev!`. Pairs each branch with a worktree + container under `../{repo}.worktrees/{port}/{branch}/`, mounting the whole repo. Kept for repo/worktree-centric workflows; use `agent-container.sh` (above) for the newer folder-based model.
 
 ```sh
 dev! feature-auth         # Create/attach a worktree + container for a branch
@@ -38,7 +38,7 @@ docker run -d -v /srv/agent-bus:/data -p 127.0.0.1:8000:8000 agent-bus
 
 ### `bus.sh`
 
-CLI companion for agent-bus. Reads `AGENT_BUS_URL` and `AGENT_BUS_TOKEN` from the environment (`dev!` passes both into containers automatically when set).
+CLI companion for agent-bus. Reads `AGENT_BUS_URL` and `AGENT_BUS_TOKEN` from the environment (`agent!` passes both into containers automatically when set).
 
 ```sh
 bus.sh send mars "Can you review PR #42?"
@@ -63,6 +63,12 @@ check-tools.sh
 Add to your `.chezmoiexternal.toml`:
 
 ```toml
+[".local/bin/agent-container.sh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-container.sh"
+    executable = true
+    refreshPeriod = "0"
+
 [".local/bin/dev-container.sh"]
     type = "file"
     url = "https://raw.githubusercontent.com/cdacos/scripts/main/dev-container.sh"
@@ -87,8 +93,9 @@ Then run `chezmoi apply`.
 ### Standalone
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/agent-container.sh -o ~/.local/bin/agent-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/dev-container.sh -o ~/.local/bin/dev-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/check-tools.sh -o ~/.local/bin/check-tools.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/bus.sh -o ~/.local/bin/bus.sh
-chmod +x ~/.local/bin/dev-container.sh ~/.local/bin/check-tools.sh ~/.local/bin/bus.sh
+chmod +x ~/.local/bin/agent-container.sh ~/.local/bin/dev-container.sh ~/.local/bin/check-tools.sh ~/.local/bin/bus.sh
 ```

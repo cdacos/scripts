@@ -1,28 +1,28 @@
 #!/bin/sh
-# dev! - Folder-based Docker dev container launcher
+# agent! - Folder-based Docker container launcher for AI agents
 #
 # Each named container mounts ONE folder (rw) plus its own persistent state under
-# ~/.local/dev-container/<name>/ (bus token, claude home, ports, folder). Nothing
+# ~/.local/agent-container/<name>/ (bus token, claude home, ports, folder). Nothing
 # else on the host is exposed. No git worktrees, no repo bind-mount, no docker.sock
 # (unless --docker is passed).
 
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="2.7"
+VERSION="0.9"
 
 # State home: per-name container state lives here. Override for testing.
-STATE_HOME="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
+STATE_HOME="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
 
 show_help() {
 	cat <<'EOF'
-Usage: dev! [name] [folder] [--save|--only] [--fork] [--keep-alive] [--port H:C] [--docker]
-       dev! kill <name>
-       dev! completion bash|zsh
-       dev! -h | --help
-       dev! --version
+Usage: agent! [name] [folder] [--save|--only] [--fork] [--keep-alive] [--port H:C] [--docker]
+       agent! kill <name>
+       agent! completion bash|zsh
+       agent! -h | --help
+       agent! --version
 
-Launches a named Docker dev container. A container remembers every folder you
+Launches a named Docker container for an AI agent. A container remembers every folder you
 SAVE to it and mounts them all (rw), at their real absolute paths, plus its own
 persistent state. By default it suspends itself when you're not using it. Free of
 git repos and worktrees.
@@ -44,9 +44,9 @@ Commands:
 
 Idle-suspend (default on):
   A container's PID 1 is a supervisor that stops the container once no interactive
-  shell has been attached for ~20s (override with DEV_SUSPEND_IDLE). Effectively:
+  shell has been attached for ~20s (override with AGENT_SUSPEND_IDLE). Effectively:
   keep a shell open to keep it alive; exit every shell and it suspends. Resume with
-  `dev! <name>` - if nothing changed that's a fast `docker start` that preserves the
+  `agent! <name>` - if nothing changed that's a fast `docker start` that preserves the
   in-container filesystem. Sessions are counted as ptys, so BACKGROUND/detached work
   (a dev server on :8000, a bus agent) does NOT hold it open - use --keep-alive for
   those (it sticks; revert with: rm <STATE_HOME>/<name>/keep-alive).
@@ -64,7 +64,7 @@ Mount set (accumulated folders):
   docker rm + run; nothing durable is lost.
 
 GitHub fork+clone (isolated agent working copy, opt-in, first create only):
-  If the folder is inside a repo with a github.com origin, dev! ASKS (only on
+  If the folder is inside a repo with a github.com origin, agent! ASKS (only on
   first create; --fork pre-answers yes, --only/--save skip it) whether to give
   the agent an isolated fork+clone INSTEAD of mounting your live tree. On yes it
   prompts for the agent's GitHub identity (a bot account you create on github.com
@@ -80,13 +80,13 @@ GitHub fork+clone (isolated agent working copy, opt-in, first create only):
 
 Start semantics:
   running   -> if the mount set is unchanged, report and quit; otherwise offer to
-               recreate to apply the change (attach: docker exec -it -u <user> dev-<name> bash)
+               recreate to apply the change (attach: docker exec -it -u <user> agent-<name> bash)
   stopped   -> if the mount set, image and run-mode are unchanged, fast-resume via
                `docker start` (keeps the in-container fs); else recreate. Then attach.
   none      -> confirm, run the token flow, build, run, attach
   Folder default is the current dir. The working dir is always the folder you pass.
 
-State layout (STATE_HOME = $DEV_CONTAINER_HOME or ~/.local/dev-container):
+State layout (STATE_HOME = $AGENT_CONTAINER_HOME or ~/.local/agent-container):
   <STATE_HOME>/.env          shared KEY=value env (AGENT_BUS_URL, GITHUB_USERNAME,
                              GITHUB_TOKEN_DOTFILES, GITCONFIG, ...) - loaded first
   <STATE_HOME>/<name>/.env   per-name KEY=value (AGENT_BUS_TOKEN, GITHUB_AGENT_*
@@ -141,9 +141,7 @@ Identity:
   are asked for the user's full name (GECOS, shown by finger/pinky), defaulting to
   the title-cased name - so 'speedy' offers "Speedy" but you can type "Speedy
   Gonzales". It is saved to <name>/fullname and reused on every recreate. The host
-  UID/GID still drive the user, so bind-mount permissions are unchanged. Containers
-  created before v2.5 keep the old 'dev'/'home/dev' (detected from their
-  Dockerfile), so upgrades don't break them.
+  UID/GID still drive the user, so bind-mount permissions are unchanged.
 
 Isolation (be honest):
   The container sees ONLY the folders you have saved to it (or, with --only, the
@@ -156,14 +154,14 @@ Isolation (be honest):
   file-shared path) - use only when the container genuinely needs to spawn containers.
 
 Examples:
-  dev! api ~/src/api --save   # remember ~/src/api and mount the set
-  dev! api ~/src/lib --save   # now mounts BOTH ~/src/api and ~/src/lib
-  dev! api ~/scratch --only   # mount just ~/scratch this run, remember nothing
-  dev! api . --port 5173      # also publish container :5173 on an auto-assigned host port
-  dev! scratch                # current dir; asks whether to save it
-  dev! ci . --save --docker   # save current dir + mount docker.sock
-  dev!                        # list all containers
-  dev! kill api               # tear down 'dev-api' and delete its state
+  agent! api ~/src/api --save   # remember ~/src/api and mount the set
+  agent! api ~/src/lib --save   # now mounts BOTH ~/src/api and ~/src/lib
+  agent! api ~/scratch --only   # mount just ~/scratch this run, remember nothing
+  agent! api . --port 5173      # also publish container :5173 on an auto-assigned host port
+  agent! scratch                # current dir; asks whether to save it
+  agent! ci . --save --docker   # save current dir + mount docker.sock
+  agent!                        # list all containers
+  agent! kill api               # tear down 'agent-api' and delete its state
 EOF
 }
 
@@ -194,8 +192,8 @@ slugify() {
 
 # Derive a valid Unix username from a container name (slug). Hyphens become
 # underscores; a leading non-letter or a clash with a common system account is
-# prefixed with 'u_'. Keeps `whoami` legible while staying adduser-safe. 'dev' is
-# left as-is (it is the historical user and a normal, unprivileged account).
+# prefixed with 'u_'. Keeps `whoami` legible while staying adduser-safe. 'agent'
+# is left as-is (it is the default fallback user and a normal, unprivileged account).
 container_username() {
 	u=$(printf '%s' "$1" | tr '-' '_')
 	case "$u" in
@@ -203,7 +201,7 @@ container_username() {
 	*) u="u_$u" ;;
 	esac
 	case "$u" in
-	dev) ;;
+	agent) ;;
 	root | bin | daemon | sys | sync | games | man | lp | mail | news | uucp | operator | nobody | sshd | postgres)
 		u="u_$u"
 		;;
@@ -217,16 +215,15 @@ container_fullname() {
 	printf '%s' "$1" | tr '-' ' ' | awk '{for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2)} 1'
 }
 
-# The in-container login user for a container. New-style Dockerfiles declare
-# `ARG DEV_USER` and get a per-name user + /home/<user>; pre-2.5 Dockerfiles (and
-# any the user stripped DEV_USER out of) keep the historical 'dev'. Grepping the
-# actual build recipe keeps the build arg, mount paths, and attach user in sync,
-# so existing containers are never mismatched by an upgrade.
+# The in-container login user for a container. Dockerfiles declare `ARG AGENT_USER`
+# and get a per-name user + /home/<user>; if a Dockerfile has had AGENT_USER stripped
+# out, fall back to 'agent'. Grepping the actual build recipe keeps the build arg,
+# mount paths, and attach user in sync, so containers are never mismatched by a rebuild.
 resolve_username() {
-	if [ -f "$1" ] && grep -q '^ARG DEV_USER' "$1"; then
+	if [ -f "$1" ] && grep -q '^ARG AGENT_USER' "$1"; then
 		container_username "$2"
 	else
-		echo dev
+		echo agent
 	fi
 }
 
@@ -385,7 +382,7 @@ ensure_shared_env() {
 	if [ ! -f "$STATE_HOME/.env" ]; then
 		mkdir -p "$STATE_HOME"
 		cat >"$STATE_HOME/.env" <<EOF
-# Shared dev-container env. Plain KEY=value only (no quotes, no \$expansion): this
+# Shared agent-container env. Plain KEY=value only (no quotes, no \$expansion): this
 # file is both sh-sourced at build time and passed to containers via --env-file.
 # Per-name <name>/.env overrides anything here.
 AGENT_BUS_URL=${AGENT_BUS_URL:-}
@@ -596,7 +593,7 @@ ensure_github_identity() {
 	mkdir -p "$name_dir"
 	if [ ! -f "$name_env" ]; then
 		cat >"$name_env" <<EOF
-# Per-name dev-container env. Plain KEY=value only (no quotes, no \$expansion).
+# Per-name agent-container env. Plain KEY=value only (no quotes, no \$expansion).
 # Overrides the shared $STATE_HOME/.env.
 EOF
 	fi
@@ -687,7 +684,7 @@ ensure_dockerignore() {
 	di="$1/.dockerignore"
 	if [ ! -f "$di" ]; then
 		cat >"$di" <<'EOF'
-# Auto-generated by dev!. Keeps the build context small and secret-free.
+# Auto-generated by agent!. Keeps the build context small and secret-free.
 # The Dockerfile lives in this dir alongside container state; ignore the state.
 .env
 ports
@@ -749,7 +746,7 @@ ensure_token() {
 	mkdir -p "$name_dir"
 	if [ ! -f "$name_env" ]; then
 		cat >"$name_env" <<EOF
-# Per-name dev-container env. Plain KEY=value only (no quotes, no \$expansion).
+# Per-name agent-container env. Plain KEY=value only (no quotes, no \$expansion).
 # Overrides the shared $STATE_HOME/.env. AGENT_BUS_TOKEN identifies this agent
 # on the bus and MUST be distinct per container.
 EOF
@@ -927,8 +924,8 @@ build_image() {
 	dockerfile="$2"
 	context="$3"
 	project_path="$4"
-	dev_user="$5"
-	dev_fullname="$6"
+	agent_user="$5"
+	agent_fullname="$6"
 
 	# Skip the build when the image already exists and nothing that feeds it has
 	# changed (same Dockerfile + same build args). Keeps folder-add recreates fast.
@@ -954,8 +951,8 @@ build_image() {
 		--build-arg HOST_PROJECT_PATH="${project_path}" \
 		--build-arg HOST_UID="$(id -u)" \
 		--build-arg HOST_GID="$(id -g)" \
-		--build-arg DEV_USER="${dev_user}" \
-		--build-arg DEV_FULLNAME="${dev_fullname}" \
+		--build-arg AGENT_USER="${agent_user}" \
+		--build-arg AGENT_FULLNAME="${agent_fullname}" \
 		-t "$image" "$context"
 	docker "$@"
 
@@ -965,13 +962,13 @@ build_image() {
 
 # The container's PID 1. By default a self-suspend supervisor: it waits for the
 # first interactive session, then exits (stopping the container) once no session
-# has been attached for DEV_SUSPEND_IDLE seconds. Sessions are counted as numeric
+# has been attached for AGENT_SUSPEND_IDLE seconds. Sessions are counted as numeric
 # slave nodes under /dev/pts (every `docker exec -it` allocates one), so it tracks
-# ALL attached shells, not just the one dev! launched. Background/detached work
+# ALL attached shells, not just the one agent! launched. Background/detached work
 # holds no pty, so it does NOT keep the container alive - see --keep-alive.
 SUPERVISOR_CMD='
-idle_limit=${DEV_SUSPEND_IDLE:-20}
-startup_limit=${DEV_SUSPEND_STARTUP:-120}
+idle_limit=${AGENT_SUSPEND_IDLE:-20}
+startup_limit=${AGENT_SUSPEND_STARTUP:-120}
 count() { ls /dev/pts 2>/dev/null | grep -c "^[0-9]"; }
 waited=0
 while [ "$(count)" -eq 0 ] && [ "$waited" -lt "$startup_limit" ]; do
@@ -1005,10 +1002,10 @@ run_container() {
 
 	claude_creds=$(get_claude_credentials)
 	claude_json=$(get_claude_json)
-	dev_user=$(resolve_username "$dockerfile" "$name")
+	agent_user=$(resolve_username "$dockerfile" "$name")
 
 	set -- --init -d \
-		--name "dev-$name" \
+		--name "agent-$name" \
 		-e "CLAUDE_CODE_CREDENTIALS=${claude_creds}" \
 		-e "CLAUDE_JSON=${claude_json}"
 
@@ -1034,8 +1031,8 @@ run_container() {
 	IFS=$oldifs
 
 	set -- "$@" \
-		-v "${claude_dir}:/home/${dev_user}/.claude" \
-		-v "${dockerfile}:/home/${dev_user}/Dockerfile" \
+		-v "${claude_dir}:/home/${agent_user}/.claude" \
+		-v "${dockerfile}:/home/${agent_user}/Dockerfile" \
 		-w "${cwd}"
 
 	[ "$docker_sock" = "true" ] && set -- "$@" -v /var/run/docker.sock:/var/run/docker.sock
@@ -1046,7 +1043,7 @@ run_container() {
 		set -- "$@" "$image" sh -c "$SUPERVISOR_CMD"
 	fi
 
-	info "Starting container 'dev-$name'..."
+	info "Starting container 'agent-$name'..."
 	docker run "$@"
 }
 
@@ -1054,7 +1051,7 @@ run_container() {
 # its Dockerfile so fast-resume and recreate paths all agree on the user).
 attach_container() {
 	au_user=$(resolve_username "$STATE_HOME/$1/Dockerfile" "$1")
-	docker exec -it -e TERM=xterm-256color -e COLORTERM=truecolor -u "$au_user" "dev-$1" bash
+	docker exec -it -e TERM=xterm-256color -e COLORTERM=truecolor -u "$au_user" "agent-$1" bash
 }
 
 # Prompt for the mount mode (save vs only) when no flag was given. Echoes the
@@ -1097,8 +1094,8 @@ cmd_up() {
 	want_fork="$7"
 	[ -n "$name" ] || error "Invalid name"
 
-	container="dev-$name"
-	image="dev-$name"
+	container="agent-$name"
+	image="agent-$name"
 	name_dir="$STATE_HOME/$name"
 	name_env="$name_dir/.env"
 	shared_env="$STATE_HOME/.env"
@@ -1235,7 +1232,7 @@ cmd_up() {
 		if [ "$keep_alive" = "true" ]; then
 			printf "  Run mode:   ${YELLOW}keep-alive${NC} (stays up until stopped)\n"
 		else
-			printf "  Run mode:   ${YELLOW}suspend when idle${NC} (stops ~%ss after the last shell exits)\n" "${DEV_SUSPEND_IDLE:-20}"
+			printf "  Run mode:   ${YELLOW}suspend when idle${NC} (stops ~%ss after the last shell exits)\n" "${AGENT_SUSPEND_IDLE:-20}"
 		fi
 		[ "$docker_sock" = "true" ] && printf "  ${RED}docker.sock: mounted (root-equivalent host access)${NC}\n"
 		printf "\nContinue? [y/n] "
@@ -1292,9 +1289,9 @@ cmd_up() {
 	[ "$first_create" = true ] && ensure_persona "$name" "$name_dir/claude"
 	[ "$first_create" = true ] && ensure_fullname "$name" "$name_dir"
 	# The Dockerfile now exists, so this reflects the real (new-style vs legacy) user.
-	dev_user=$(resolve_username "$dockerfile" "$name")
-	dev_fullname=$(read_fullname "$name_dir" "$name")
-	build_image "$image" "$dockerfile" "$context" "$folder" "$dev_user" "$dev_fullname"
+	agent_user=$(resolve_username "$dockerfile" "$name")
+	agent_fullname=$(read_fullname "$name_dir" "$name")
+	build_image "$image" "$dockerfile" "$context" "$folder" "$agent_user" "$agent_fullname"
 	run_container "$name" "$desired_ports" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list" "$keep_alive"
 
 	printf "\n"
@@ -1305,7 +1302,7 @@ cmd_up() {
 		printf "${CYAN}Inside: commit, 'git push -u origin %s', then 'gh pr create --repo %s --fill'.${NC}\n" "$name" "$gh_upstream"
 	fi
 	if [ "$keep_alive" != "true" ]; then
-		printf "${CYAN}Idle-suspend on: exit every shell and it stops in ~%ss. Resume with 'dev! %s'.${NC}\n" "${DEV_SUSPEND_IDLE:-20}" "$name"
+		printf "${CYAN}Idle-suspend on: exit every shell and it stops in ~%ss. Resume with 'agent! %s'.${NC}\n" "${AGENT_SUSPEND_IDLE:-20}" "$name"
 	fi
 	printf "\n"
 	attach_container "$name"
@@ -1314,7 +1311,7 @@ cmd_up() {
 # List all containers with their status.
 cmd_list() {
 	if [ ! -d "$STATE_HOME" ]; then
-		info "No dev-containers yet. Create one with: dev! <name> [folder]"
+		info "No agent containers yet. Create one with: agent! <name> [folder]"
 		return 0
 	fi
 
@@ -1342,7 +1339,7 @@ cmd_list() {
 		else
 			folder="[$n] $(first_mount "$d/mounts") +$((n - 1))"
 		fi
-		status=$(get_container_status "dev-$name")
+		status=$(get_container_status "agent-$name")
 		case "$status" in
 		running) printf "%-16s %-8s ${GREEN}%-9s${NC} %s\n" "$name" "$port" "running" "$folder" ;;
 		stopped) printf "%-16s %-8s ${YELLOW}%-9s${NC} %s\n" "$name" "$port" "stopped" "$folder" ;;
@@ -1350,22 +1347,22 @@ cmd_list() {
 		esac
 	done
 
-	[ "$found" = false ] && info "No dev-containers yet. Create one with: dev! <name> [folder]"
+	[ "$found" = false ] && info "No agent containers yet. Create one with: agent! <name> [folder]"
 	return 0
 }
 
 # Stop+remove container and image, delete the state dir.
 cmd_kill() {
 	name=$(slugify "$1")
-	[ -n "$name" ] || error "Usage: dev! kill <name>"
-	container="dev-$name"
+	[ -n "$name" ] || error "Usage: agent! kill <name>"
+	container="agent-$name"
 	name_dir="$STATE_HOME/$name"
 	port=$(primary_host_port "$(cat "$name_dir/ports" 2>/dev/null || true)")
 	[ -n "$port" ] || port="?"
 
 	printf "\n${RED}Will kill:${NC}\n"
 	printf "  Container: ${YELLOW}%s${NC}\n" "$container"
-	printf "  Image:     ${YELLOW}%s${NC}\n" "dev-$name"
+	printf "  Image:     ${YELLOW}%s${NC}\n" "agent-$name"
 	printf "  State dir: ${YELLOW}%s${NC}\n" "$name_dir"
 	printf "  Port:      ${YELLOW}%s${NC}\n" "$port"
 	printf "\nAre you sure? [y/n] "
@@ -1396,7 +1393,7 @@ cmd_kill() {
 		;;
 	esac
 
-	docker rmi "dev-$name" >/dev/null 2>&1 || true
+	docker rmi "agent-$name" >/dev/null 2>&1 || true
 	had_fork=false
 	[ -d "$name_dir/repo" ] && had_fork=true
 	[ -d "$name_dir" ] && rm -rf "$name_dir"
@@ -1413,8 +1410,8 @@ cmd_kill() {
 # Quoted heredoc: everything below is literal (Dockerfile ARGs, not shell vars).
 write_default_dockerfile() {
 	cat >"$1" <<'DOCKERFILE'
-# Dockerfile - default dev container generated by dev! (edit to taste).
-# Minimum requirement: a 'dev' user with bash.
+# Dockerfile - default container generated by agent! (edit to taste).
+# Minimum requirement: a login user with bash (named by AGENT_USER).
 
 FROM alpine:latest
 
@@ -1435,35 +1432,35 @@ RUN apk add --no-cache \
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 
-# === BUILD ARGS (passed by dev!) ===
+# === BUILD ARGS (passed by agent!) ===
 ARG GITCONFIG=""         # Contents of host ~/.gitconfig
 ARG GITHUB_USERNAME=""   # For dotfiles repo (optional)
-ARG HOST_PROJECT_PATH="/home/dev/src"  # Target folder path, for path parity with host
+ARG HOST_PROJECT_PATH="/home/agent/src"  # Target folder path, for path parity with host
 ARG HOST_UID=1000        # Host user's UID (for volume permission parity)
 ARG HOST_GID=1000        # Host user's GID
-ARG DEV_USER=dev         # In-container login user + home (defaults to the container name)
-ARG DEV_FULLNAME=Developer  # GECOS display name (what finger/pinky show)
+ARG AGENT_USER=agent       # In-container login user + home (defaults to the container name)
+ARG AGENT_FULLNAME=Agent   # GECOS display name (what finger/pinky show)
 
-# Create the login user (password 'dev') matching host UID/GID where possible.
-# Name and home come from DEV_USER; DEV_FULLNAME is the GECOS. Falls back cleanly
+# Create the login user (password 'agent') matching host UID/GID where possible.
+# Name and home come from AGENT_USER; AGENT_FULLNAME is the GECOS. Falls back cleanly
 # when the host GID/UID collides with an existing one.
-RUN (addgroup -g "${HOST_GID}" "${DEV_USER}" 2>/dev/null || addgroup "${DEV_USER}") \
-    && (adduser -D -u "${HOST_UID}" -G "${DEV_USER}" -g "${DEV_FULLNAME}" -s /bin/bash "${DEV_USER}" 2>/dev/null \
-        || adduser -D -G "${DEV_USER}" -g "${DEV_FULLNAME}" -s /bin/bash "${DEV_USER}") \
-    && echo "${DEV_USER}:dev" | chpasswd \
-    && addgroup "${DEV_USER}" wheel \
-    && addgroup "${DEV_USER}" root \
+RUN (addgroup -g "${HOST_GID}" "${AGENT_USER}" 2>/dev/null || addgroup "${AGENT_USER}") \
+    && (adduser -D -u "${HOST_UID}" -G "${AGENT_USER}" -g "${AGENT_FULLNAME}" -s /bin/bash "${AGENT_USER}" 2>/dev/null \
+        || adduser -D -G "${AGENT_USER}" -g "${AGENT_FULLNAME}" -s /bin/bash "${AGENT_USER}") \
+    && echo "${AGENT_USER}:agent" | chpasswd \
+    && addgroup "${AGENT_USER}" wheel \
+    && addgroup "${AGENT_USER}" root \
     && sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
 # Copy host user's git config (passed as build arg)
-RUN if [ -n "$GITCONFIG" ]; then echo "$GITCONFIG" > /home/${DEV_USER}/.gitconfig && chown ${DEV_USER}:${DEV_USER} /home/${DEV_USER}/.gitconfig; fi
+RUN if [ -n "$GITCONFIG" ]; then echo "$GITCONFIG" > /home/${AGENT_USER}/.gitconfig && chown ${AGENT_USER}:${AGENT_USER} /home/${AGENT_USER}/.gitconfig; fi
 
 # Create host path directory structure (as root for arbitrary paths like /Users/...)
-RUN mkdir -p "${HOST_PROJECT_PATH}" && chown -R ${DEV_USER}:${DEV_USER} "$(echo ${HOST_PROJECT_PATH} | cut -d'/' -f1-2)"
+RUN mkdir -p "${HOST_PROJECT_PATH}" && chown -R ${AGENT_USER}:${AGENT_USER} "$(echo ${HOST_PROJECT_PATH} | cut -d'/' -f1-2)"
 
 # Entrypoint to inject Claude config from env vars. Written as root to a fixed path
 # so the ENTRYPOINT is independent of the user/home; ~ resolves to the login user's
-# home at runtime, since the container's main process runs as ${DEV_USER}.
+# home at runtime, since the container's main process runs as ${AGENT_USER}.
 RUN <<'SCRIPT' cat > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 #!/bin/bash
 if [ -n "$CLAUDE_CODE_CREDENTIALS" ]; then
@@ -1477,10 +1474,10 @@ exec "$@"
 SCRIPT
 
 # Switch to the login user for remaining setup
-USER ${DEV_USER}
-WORKDIR /home/${DEV_USER}
+USER ${AGENT_USER}
+WORKDIR /home/${AGENT_USER}
 
-RUN mkdir -p /home/${DEV_USER}/.local/bin
+RUN mkdir -p /home/${AGENT_USER}/.local/bin
 
 # Configure shell: PATH, aliases ($HOME keeps this home-independent)
 RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc \
@@ -1488,7 +1485,7 @@ RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc \
     && echo "alias ll='ls -la'" >> ~/.bashrc
 
 # Agent GitHub identity: when a per-agent PAT is injected at runtime (env vars
-# GITHUB_AGENT_USER/TOKEN/EMAIL, set by dev!'s fork+clone flow via --env-file),
+# GITHUB_AGENT_USER/TOKEN/EMAIL, set by agent!'s fork+clone flow via --env-file),
 # wire up gh + git so 'git push' and 'gh pr create' act as the agent. The
 # credential helper is stored single-quoted, so $GITHUB_AGENT_TOKEN is expanded by
 # git at push time (from the env), never written to disk. A no-op without a token.
@@ -1516,14 +1513,14 @@ RUN echo 'set -g mouse on' > ~/.tmux.conf \
     && echo 'bind m set -g mouse \\; display "Mouse: #{?mouse,ON,OFF}"' >> ~/.tmux.conf
 
 # No-op afplay stub (macOS command not available in Linux)
-RUN echo '#!/bin/sh' > /home/${DEV_USER}/.local/bin/afplay \
-    && echo 'exit 0' >> /home/${DEV_USER}/.local/bin/afplay \
-    && chmod +x /home/${DEV_USER}/.local/bin/afplay
+RUN echo '#!/bin/sh' > /home/${AGENT_USER}/.local/bin/afplay \
+    && echo 'exit 0' >> /home/${AGENT_USER}/.local/bin/afplay \
+    && chmod +x /home/${AGENT_USER}/.local/bin/afplay
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # Re-declare ARG after USER switch (ARGs don't persist)
-ARG HOST_PROJECT_PATH="/home/dev/src"
+ARG HOST_PROJECT_PATH="/home/agent/src"
 WORKDIR ${HOST_PROJECT_PATH}
 DOCKERFILE
 }
@@ -1533,10 +1530,10 @@ cmd_completion() {
 	case "$1" in
 	bash)
 		cat <<'EOF'
-_dev_complete() {
+_agent_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
-    local state="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
+    local state="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
     local names=""
     if [ -d "$state" ]; then
         names=$(find "$state" -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
@@ -1547,13 +1544,13 @@ _dev_complete() {
         COMPREPLY=($(compgen -W "kill completion $names" -- "$cur"))
     fi
 }
-complete -F _dev_complete dev-container.sh
+complete -F _agent_complete agent-container.sh
 EOF
 		;;
 	zsh)
 		cat <<'EOF'
-_dev_complete() {
-    local state="${DEV_CONTAINER_HOME:-$HOME/.local/dev-container}"
+_agent_complete() {
+    local state="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
     local names=()
     if [ -d "$state" ]; then
         names=(${(f)"$(find "$state" -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)"})
@@ -1565,11 +1562,11 @@ _dev_complete() {
         compadd -a names
     fi
 }
-compdef _dev_complete dev-container.sh
+compdef _agent_complete agent-container.sh
 EOF
 		;;
 	*)
-		echo "Usage: dev-container.sh completion [bash|zsh]" >&2
+		echo "Usage: agent-container.sh completion [bash|zsh]" >&2
 		exit 1
 		;;
 	esac
@@ -1594,12 +1591,12 @@ main() {
 		exit 0
 		;;
 	kill)
-		[ -n "$2" ] || error "Usage: dev! kill <name>"
+		[ -n "$2" ] || error "Usage: agent! kill <name>"
 		cmd_kill "$2"
 		exit 0
 		;;
 	completion)
-		[ -n "$2" ] || error "Usage: dev! completion bash|zsh"
+		[ -n "$2" ] || error "Usage: agent! completion bash|zsh"
 		cmd_completion "$2"
 		exit 0
 		;;

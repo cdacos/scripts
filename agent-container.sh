@@ -1,15 +1,16 @@
 #!/bin/sh
 # agent! - Folder-based Docker container launcher for AI agents
 #
-# Each named container mounts ONE folder (rw) plus its own persistent state under
-# ~/.local/agent-container/<name>/ (bus token, claude home, ports, folder). Nothing
-# else on the host is exposed. No git worktrees, no repo bind-mount, no docker.sock
-# (unless --docker is passed).
+# Each named container mounts its accumulated set of saved folders (rw, zero or more)
+# plus its own persistent state under ~/.local/agent-container/<name>/ (bus token,
+# claude home, ports, folder). With no folder argument nothing new is mapped and the
+# working dir is the agent's home. Nothing else on the host is exposed. No git
+# worktrees, no repo bind-mount, no docker.sock (unless --docker is passed).
 
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="0.9"
+VERSION="1.0"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
@@ -24,15 +25,17 @@ Usage: agent! [name] [folder] [--save|--only] [--fork] [--keep-alive] [--port H:
 
 Launches a named Docker container for an AI agent. A container remembers every folder you
 SAVE to it and mounts them all (rw), at their real absolute paths, plus its own
-persistent state. By default it suspends itself when you're not using it. Free of
-git repos and worktrees.
+persistent state. The folder argument is OPTIONAL: omit it to map no folder (the agent
+gets just its own home + saved set); pass "." to map the current dir. By default it
+suspends itself when you're not using it. Free of git repos and worktrees.
 
 Commands:
   (no args)                List all containers: NAME, PORT, STATUS, FOLDERS
-  <name> [folder]          Create/resume container; ask whether to save the folder
-  <name> [folder] --save   Add folder to the set, mount the whole set
-  <name> [folder] --only   Mount JUST this folder, don't remember it
-  <name> [folder] --fork   Pre-answer yes to the fork+clone prompt (see GitHub fork+clone)
+  <name>                   Create/resume with no new folder (working dir = agent home)
+  <name> <folder>          Create/resume container; ask whether to save the folder
+  <name> <folder> --save   Add folder to the set, mount the whole set (needs a folder)
+  <name> <folder> --only   Mount JUST this folder, don't remember it (needs a folder)
+  <name> <folder> --fork   Pre-answer yes to the fork+clone prompt (see GitHub fork+clone)
   <name> ... --port H:C     Publish container port C on host port H (repeatable;
                            "--port C" auto-assigns a free host port). Applied on recreate.
   <name> ... --keep-alive  Don't self-suspend; run until stopped (see Idle-suspend)
@@ -53,10 +56,11 @@ Idle-suspend (default on):
 
 Mount set (accumulated folders):
   Each container keeps a set of remembered folders as symlinks under
-  <STATE_HOME>/<name>/mounts/. --save adds the folder to the set; a bare
-  invocation asks (save/only) unless the folder is already saved. --only mounts
-  just the given folder for this run and remembers nothing. Every save-mode start
-  mounts the WHOLE set; the folder you pass is the working dir. Folders deleted on
+  <STATE_HOME>/<name>/mounts/. --save adds the folder to the set; passing a folder
+  with no flag asks (save/only) unless it is already saved. No folder argument adds
+  nothing and just mounts the existing set. --only mounts just the given folder for
+  this run and remembers nothing. Every save-mode start mounts the WHOLE set; the
+  folder you pass (if any) is the working dir. Folders deleted on
   the host are skipped with a warning. Remove one from the set by hand:
       rm <STATE_HOME>/<name>/mounts/<link>
   Docker fixes bind mounts at create time, so changing the set (saving a new
@@ -84,7 +88,9 @@ Start semantics:
   stopped   -> if the mount set, image and run-mode are unchanged, fast-resume via
                `docker start` (keeps the in-container fs); else recreate. Then attach.
   none      -> confirm, run the token flow, build, run, attach
-  Folder default is the current dir. The working dir is always the folder you pass.
+  No folder argument maps no folder (the saved set, if any, still mounts) and the
+  working dir becomes the agent's home. Pass a folder (e.g. ".") to map it; then
+  the working dir is that folder.
 
 State layout (STATE_HOME = $AGENT_CONTAINER_HOME or ~/.local/agent-container):
   <STATE_HOME>/.env          shared KEY=value env (AGENT_BUS_URL, GITHUB_USERNAME,
@@ -1086,7 +1092,7 @@ prompt_mode() {
 # "true" (pre-answer the fork prompt yes) or "".
 cmd_up() {
 	name=$(slugify "$1")
-	folder_arg="${2:-.}"
+	folder_arg="$2"
 	docker_sock="$3"
 	mode="$4"
 	keep_alive="$5"
@@ -1104,7 +1110,37 @@ cmd_up() {
 	context="$name_dir"
 	keepalive_marker="$name_dir/keep-alive"
 
-	folder=$(resolve_folder "$folder_arg")
+	# Folder is now OPTIONAL. No folder argument -> mount nothing new (the saved set,
+	# if any, still mounts); the working dir becomes the agent's home. Pass "." to map
+	# the current dir. The folder-referencing flags need an actual folder.
+	if [ -n "$folder_arg" ]; then
+		folder=$(resolve_folder "$folder_arg")
+		have_folder=true
+	else
+		folder=""
+		have_folder=false
+		[ "$mode" = only ] && error "--only needs a folder (nothing to mount)"
+		[ "$mode" = save ] && error "--save needs a folder (nothing to save)"
+		[ "$want_fork" = true ] && error "--fork needs a folder inside a GitHub repo"
+	fi
+	# The container's working dir / HOST_PROJECT_PATH. With a folder mapped it is that
+	# folder. With no folder it is the agent's home on a fresh create, but an EXISTING
+	# container inherits its recorded working dir (the `folder` marker) so that a bare
+	# `agent! <name>` resume doesn't change the baked WORKDIR and force a rebuild.
+	# Predict the login user the same way the build will (a first create always writes
+	# an AGENT_USER Dockerfile) so it stays in sync.
+	if [ -f "$dockerfile" ]; then
+		workdir_home="/home/$(resolve_username "$dockerfile" "$name")"
+	else
+		workdir_home="/home/$(container_username "$name")"
+	fi
+	if [ "$have_folder" = true ]; then
+		workdir="$folder"
+	elif [ -s "$name_dir/folder" ]; then
+		workdir=$(cat "$name_dir/folder")
+	else
+		workdir="$workdir_home"
+	fi
 	migrate_legacy_folder "$name_dir"
 
 	status=$(get_container_status "$container")
@@ -1118,7 +1154,8 @@ cmd_up() {
 	# normal folder mount. The clone becomes the sole mounted working copy.
 	use_fork=false
 	gh_upstream=""
-	if [ "$first_create" = true ] && { [ "$want_fork" = true ] || [ -z "$mode" ]; } &&
+	if [ "$have_folder" = true ] && [ "$first_create" = true ] &&
+		{ [ "$want_fork" = true ] || [ -z "$mode" ]; } &&
 		gh_upstream=$(github_remote "$folder"); then
 		if [ "$want_fork" = true ]; then
 			use_fork=true
@@ -1132,10 +1169,11 @@ cmd_up() {
 	fi
 	[ "$use_fork" = true ] && mode=save
 
-	# Resolve the mode. If no flag: an already-saved folder needs no decision
-	# (just start the set); anything else is ambiguous, so ask. Skipped when
-	# forking (the clone is force-saved above).
-	if [ "$use_fork" = false ] && [ -z "$mode" ]; then
+	# Resolve the mode. With no folder there is nothing to save/ask about (mode stays
+	# empty -> the whole saved set still mounts). Otherwise, if no flag: an
+	# already-saved folder needs no decision (just start the set); anything else is
+	# ambiguous, so ask. Skipped when forking (the clone is force-saved above).
+	if [ "$have_folder" = true ] && [ "$use_fork" = false ] && [ -z "$mode" ]; then
 		if [ -L "$mounts_dir/$(encode_path "$folder")" ]; then
 			mode=save
 		else
@@ -1199,7 +1237,7 @@ cmd_up() {
 		desired_p=$(printf '%s\n' "$desired_ports" | sort -u)
 		current_p=$(current_port_bindings "$container")
 		if [ "$desired" = "$current" ] && [ "$desired_p" = "$current_p" ] &&
-			image_up_to_date "$image" "$dockerfile" "$context" "$folder" &&
+			image_up_to_date "$image" "$dockerfile" "$context" "$workdir" &&
 			[ "$(container_keepalive "$container")" = "$keep_alive" ]; then
 			info "Resuming '$container'..."
 			docker start "$container" >/dev/null
@@ -1221,6 +1259,8 @@ cmd_up() {
 			printf "  Repo:       ${YELLOW}%s${NC} (GitHub)\n" "$gh_upstream"
 			printf "  Fork clone: ${YELLOW}%s/repo${NC} (fork to the agent, clone here, branch '%s')\n" "$name_dir" "$name"
 			printf "              ${CYAN}isolated: only the clone is mounted, not %s${NC}\n" "$folder"
+		elif [ "$have_folder" = false ]; then
+			printf "  Folder:     ${YELLOW}(none)${NC} - no folder mapped; working dir %s\n" "$workdir"
 		elif [ "$mode" = only ]; then
 			printf "  Folder:     ${YELLOW}%s${NC} (only - not saved)\n" "$folder"
 		else
@@ -1261,6 +1301,7 @@ cmd_up() {
 			clone=$(setup_github_clone "$name" "$name_dir" "$gh_upstream"); then
 			load_env_files "$shared_env" "$name_env"
 			folder="$clone"
+			workdir="$clone"
 			success "Fork clone ready: $clone"
 		else
 			use_fork=false
@@ -1269,8 +1310,8 @@ cmd_up() {
 	fi
 
 	printf '%s\n' "$desired_ports" >"$name_dir/ports"
-	printf '%s' "$folder" >"$name_dir/folder"
-	[ "$mode" = save ] && add_mount "$mounts_dir" "$folder"
+	[ "$have_folder" = true ] && printf '%s' "$folder" >"$name_dir/folder"
+	[ "$mode" = save ] && [ "$have_folder" = true ] && add_mount "$mounts_dir" "$folder"
 	if [ "$keep_alive" = "true" ]; then : >"$keepalive_marker"; else rm -f "$keepalive_marker"; fi
 
 	if [ ! -f "$dockerfile" ]; then
@@ -1291,8 +1332,11 @@ cmd_up() {
 	# The Dockerfile now exists, so this reflects the real (new-style vs legacy) user.
 	agent_user=$(resolve_username "$dockerfile" "$name")
 	agent_fullname=$(read_fullname "$name_dir" "$name")
-	build_image "$image" "$dockerfile" "$context" "$folder" "$agent_user" "$agent_fullname"
-	run_container "$name" "$desired_ports" "$folder" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list" "$keep_alive"
+	# No folder, fresh container (no recorded working dir): use the now-authoritative
+	# agent home. An existing container keeps its inherited workdir (set above).
+	[ "$have_folder" = false ] && [ ! -s "$name_dir/folder" ] && workdir="/home/$agent_user"
+	build_image "$image" "$dockerfile" "$context" "$workdir" "$agent_user" "$agent_fullname"
+	run_container "$name" "$desired_ports" "$workdir" "$image" "$name_dir/claude" "$docker_sock" "$shared_env" "$name_env" "$dockerfile" "$mount_list" "$keep_alive"
 
 	printf "\n"
 	success "Container ready!"
@@ -1333,7 +1377,8 @@ cmd_list() {
 		fi
 		n=$(count_mounts "$d/mounts")
 		if [ "$n" -eq 0 ]; then
-			folder=$(cat "$d/folder" 2>/dev/null || echo "?")
+			folder=$(cat "$d/folder" 2>/dev/null || echo "(none)")
+			[ -n "$folder" ] || folder="(none)"
 		elif [ "$n" -eq 1 ]; then
 			folder=$(first_mount "$d/mounts")
 		else
@@ -1603,7 +1648,7 @@ main() {
 	*)
 		name="$1"
 		shift
-		folder_arg="."
+		folder_arg=""
 		docker_sock=false
 		mode=""
 		keep_alive=""

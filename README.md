@@ -6,11 +6,12 @@ Shared developer utility scripts.
 
 ### `agent-container.sh` (aka `agent`)
 
-Folder-based Docker agent container launcher. `agent! <name> [folder]` starts a named container that mounts **only** the given folder (default: current dir) plus its own persistent state under `~/.local/agent-container/<name>/` (bus token, Claude home, port) — nothing else on the host. `docker.sock` is not mounted unless you pass `--docker`.
+Folder-based Docker agent container launcher. `agent! <name> [folder]` starts a named container that mounts its accumulated set of saved folders (rw) plus its own persistent state under `~/.local/agent-container/<name>/` (bus token, Claude home, port) — nothing else on the host. The folder argument is **optional**: omit it to map no folder (the agent gets just its own home + any saved set — good for an agent that clones/pulls its own repos); pass `.` to map the current dir. `docker.sock` is not mounted unless you pass `--docker`.
 
 ```sh
 agent! api ~/src/api        # Create/start container 'agent-api' mounting ~/src/api
-agent! scratch              # Container 'agent-scratch' on the current dir
+agent! scratch              # Container 'agent-scratch' with NO folder mapped (working dir = agent home)
+agent! scratch .            # Same container, now mapping the current dir
 agent! ci . --docker        # Also mount the host Docker socket (root-equivalent — opt-in)
 agent!                      # List all containers (NAME, PORT, STATUS, FOLDER)
 agent! kill api             # Tear down 'agent-api' and delete its state

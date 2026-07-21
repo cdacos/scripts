@@ -3,17 +3,25 @@
 #
 # Each named container mounts its accumulated set of saved folders (rw, zero or more)
 # plus its own persistent state under ~/.local/agent-container/<name>/ (bus token,
-# claude home, ports, folder). With no folder argument nothing new is mapped and the
-# working dir is the agent's home. Nothing else on the host is exposed. No git
-# worktrees, no repo bind-mount, no docker.sock (unless --docker is passed).
+# claude home, ports, folder, and persisted home subdirs ~/.ssh + ~/src). With no
+# folder argument nothing new is mapped and the working dir is the agent's home.
+# Nothing else on the host is exposed. No git worktrees, no repo bind-mount, no
+# docker.sock (unless --docker is passed).
 
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="1.1"
+VERSION="1.2"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
+
+# Home subdirs persisted across recreate/kill by bind-mounting them from the
+# container's state dir (<name>/home/<dir>). These hold pure runtime state the
+# Dockerfile never writes (unlike ~/.bashrc, ~/.local/bin, dotfiles), so the mounts
+# shadow nothing and never go stale. .ssh keeps agent SSH keys; src keeps clones the
+# agent makes itself. Space-separated, relative to the login user's home.
+PERSIST_DIRS=".ssh src"
 
 show_help() {
 	cat <<'EOF'
@@ -110,6 +118,9 @@ State layout (STATE_HOME = $AGENT_CONTAINER_HOME or ~/.local/agent-container):
   <STATE_HOME>/<name>/fullname  the login user's GECOS display name (asked on create)
   <STATE_HOME>/<name>/keep-alive  marker: present => opt out of idle-suspend (rm to revert)
   <STATE_HOME>/<name>/claude persistent ~/.claude (seeded once from host ~/.claude)
+  <STATE_HOME>/<name>/home   persisted home subdirs bind-mounted into the agent's
+                             home so they survive recreate/kill: home/.ssh -> ~/.ssh
+                             (keys; kept 0700), home/src -> ~/src (agent's own clones)
 
 Env files:
   Plain KEY=value only (no quotes, no $expansion) so the same file can be sh-sourced
@@ -354,9 +365,9 @@ migrate_legacy_folder() {
 }
 
 # Sorted list of a running container's folder-mount sources. Excludes the
-# container's own internal mounts (claude dir + Dockerfile under name_dir) and
-# docker.sock, but KEEPS a fork clone at <name_dir>/repo - it is a real folder
-# mount, so it must stay in the diff or resume would recreate on every run.
+# container's own internal mounts (claude dir + Dockerfile + persisted home subdirs
+# under name_dir) and docker.sock, but KEEPS a fork clone at <name_dir>/repo - it is
+# a real folder mount, so it must stay in the diff or resume would recreate on every run.
 current_folder_mounts() {
 	cfm_container="$1"
 	cfm_name_dir="$2"
@@ -365,6 +376,7 @@ current_folder_mounts() {
 			[ -n "$src" ] || continue
 			case "$src" in
 			"$cfm_name_dir"/claude | "$cfm_name_dir"/Dockerfile) continue ;;
+			"$cfm_name_dir"/home/*) continue ;;
 			/var/run/docker.sock) continue ;;
 			*) echo "$src" ;;
 			esac
@@ -665,6 +677,19 @@ setup_github_clone() {
 	return 0
 }
 
+# Create the persisted home subdirs (PERSIST_DIRS) under <name>/home so they exist to
+# bind-mount into the agent's home. Idempotent. .ssh gets 700 or OpenSSH refuses the
+# keys inside (the entrypoint re-chmods at runtime too, in case a host copy is looser).
+ensure_persist_dirs() {
+	epd_root="$1"
+	for pd in $PERSIST_DIRS; do
+		d="$epd_root/$pd"
+		[ -d "$d" ] && continue
+		mkdir -p "$d"
+		[ "$pd" = ".ssh" ] && chmod 700 "$d"
+	done
+}
+
 # Seed a fresh per-name claude dir from host ~/.claude (settings/skills/plugins only).
 seed_claude() {
 	claude_dir="$1"
@@ -699,14 +724,15 @@ fullname
 claude
 mounts
 repo
+home
 .build-sig
 EOF
 		return 0
 	fi
 	# Upgrade older ignore files (mounts/ can contain symlinks to large host
-	# folders; repo/ is a fork clone; .build-sig is the build cache marker - none
-	# of these belong in the build context).
-	for entry in mounts repo .build-sig fullname; do
+	# folders; repo/ is a fork clone; home/ holds persisted home subdirs;
+	# .build-sig is the build cache marker - none belong in the build context).
+	for entry in mounts repo home .build-sig fullname; do
 		grep -qxF "$entry" "$di" || printf '%s\n' "$entry" >>"$di"
 	done
 }
@@ -1041,6 +1067,14 @@ run_container() {
 		-v "${dockerfile}:/home/${agent_user}/Dockerfile" \
 		-w "${cwd}"
 
+	# Persisted home subdirs (PERSIST_DIRS): bind-mounted from <name>/home so ~/.ssh
+	# keys and ~/src clones survive recreate/kill. The Dockerfile never writes these
+	# paths, so the mounts shadow nothing.
+	name_dir="$STATE_HOME/$name"
+	for pd in $PERSIST_DIRS; do
+		set -- "$@" -v "${name_dir}/home/${pd}:/home/${agent_user}/${pd}"
+	done
+
 	[ "$docker_sock" = "true" ] && set -- "$@" -v /var/run/docker.sock:/var/run/docker.sock
 
 	if [ "$keep_alive" = "true" ]; then
@@ -1329,6 +1363,7 @@ cmd_up() {
 
 	[ "$first_create" = true ] && ensure_token "$name" "$name_dir" "$name_env"
 	seed_claude "$name_dir/claude"
+	ensure_persist_dirs "$name_dir/home"
 	[ "$first_create" = true ] && ensure_persona "$name" "$name_dir/claude"
 	[ "$first_create" = true ] && ensure_fullname "$name" "$name_dir"
 	# The Dockerfile now exists, so this reflects the real (new-style vs legacy) user.
@@ -1522,6 +1557,9 @@ fi
 if [ -n "$CLAUDE_JSON" ]; then
   echo "$CLAUDE_JSON" > ~/.claude.json
 fi
+# ~/.ssh is a persisted bind mount (agent! PERSIST_DIRS); OpenSSH refuses keys unless
+# the dir is 0700. Tighten it here in case the host copy carries looser perms.
+if [ -d ~/.ssh ]; then chmod 700 ~/.ssh 2>/dev/null || true; fi
 exec "$@"
 SCRIPT
 

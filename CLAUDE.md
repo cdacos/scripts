@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository purpose
 
-Standalone developer utility shell scripts, distributed as single files via raw GitHub URLs (users install them with chezmoi externals or curl — see README.md). Each script must therefore remain **self-contained in one file** with no dependencies on other files in this repo. The exception is `agent-bus/`, a deployable Go service (single source file, stdlib only — keep it dependency-free).
+Standalone developer utility shell scripts, distributed as single files via raw GitHub URLs (users install them with chezmoi externals or curl — see README.md). Each script must therefore remain **self-contained in one file** with no dependencies on other files in this repo. (`bus.sh` is the shell client for the **agent-bus** service, which now lives in its own repo at `../agent-bus`.)
 
 ## Commands
 
@@ -13,12 +13,6 @@ There is no test framework. Lint and format shell scripts with:
 ```sh
 shellcheck dev-container.sh dev-container-per-repo.sh check-tools.sh bus.sh
 shfmt -d .          # diff formatting issues (shfmt -w to fix)
-```
-
-Build (and implicitly vet/compile-check) the agent-bus service with:
-
-```sh
-docker build -t agent-bus ./agent-bus   # runs go vet + go build inside the image
 ```
 
 Both tools are preinstalled in the dev container (`dev-container.sh`'s embedded default image). To manually test `dev-container.sh`, run it against a scratch folder (`DEV_CONTAINER_HOME=/tmp/dc dev! test /some/folder`) — it requires Docker, auto-writes the per-container Dockerfile on first create, and prompts interactively before creating/killing anything.
@@ -53,17 +47,9 @@ The main script. `dev! <name> [folder] [--save|--only] [--keep-alive] [--docker]
 - **Isolation stance** (stated honestly in `--help`): the container sees only its saved folder set (or, with `--only`, the single passed folder) + its claude dir — but the saved set grows on every `--save`, so a long-lived container's reach is whatever has accumulated (`ls -l <name>/mounts`). Network is **not** isolated. `docker.sock` is **not** mounted unless `--docker` is passed — it grants root-equivalent host access (on macOS the whole Docker VM), so it is opt-in.
 - **Dockerfile ownership**: each container owns exactly one Dockerfile at `$STATE_HOME/<name>/Dockerfile`, built with context `$STATE_HOME/<name>/` (a generated `.dockerignore` (kept up to date via `ensure_dockerignore`, which appends newer entries to pre-existing files) keeps that dir's `.env`/`port`/`folder`/`fullname`/`mounts`/`.build-sig`/`claude` state and secrets out of the build context). `write_default_dockerfile` writes a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux, and the creds-injecting entrypoint) there on first create (past the confirm gate, so an aborted create leaves no state) — the script is distributed standalone, so this default is **embedded as a heredoc** rather than read from disk, and it is the single source for this repo's own dev container too (edit the heredoc to change it). The Dockerfile is **bind-mounted rw at `~/Dockerfile`** (the login user's home) so the container can edit its own build recipe; edits take effect on the next recreate. The target folder's own Dockerfiles are **ignored** — crib from them by hand. There is no `dev! init` and no per-folder `Dockerfile.dev`. Its only hard requirement is a login user with bash (named `DEV_USER`, defaulting to the container name — see **Named identity**), created with `HOST_UID`/`HOST_GID` build args for volume permission parity.
 
-## Architecture: agent-bus/
+## Architecture: bus.sh
 
-Self-hosted HTTP message bus so LLM agents (in dev containers, on other machines, in the cloud) can message each other. Small Go package (`main.go` + `ui.go`, stdlib only) in a scratch container, designed to sit behind an existing reverse proxy that handles TLS. The core principle: **the bus stays frozen; new integrations are clients** — the web UI is an embedded page using a normal agent token, and the Slack bridge (`agent-bus/slack-bridge/`, separate binary) is just another registered agent.
-
-- **Files are the storage layer, the service is the only writer.** Everything lives under `/data` (bind mount): `config/agents.json` (token sha256 hashes + topic ACLs, hot-reloaded on mtime change), per-agent `inbox/` (one JSON file per undelivered DM, removed on ack), per-agent `messages.jsonl`/`sent.jsonl` (permanent history), and `topics/<topic>/<date>.jsonl` logs. No database; backup = rsync of `/data`.
-- **Contention model:** per-file-path mutexes serialize appends; inbox writes are temp-file + atomic rename. The in-memory pubsub only *notifies* long-pollers (`GET /inbox?wait=`) and SSE watchers (`/topics/{t}/watch`) — durable delivery never depends on it, messages hit disk before notification.
-- **Auth:** bearer token per agent; only sha256 hashes are stored server-side. ACLs (`publish`/`subscribe` arrays, `*` and `prefix-*` wildcards) apply to topics; any registered agent may DM any other. `"admin": true` grants read-only oversight (any agent's history via `/agents/{name}/history`, any topic) but never changes write behavior.
-- **History is permanent:** acking removes only the inbox copy; `GET /history` serves the merged sent+received archive. Nothing in the server deletes history files.
-- **Slack bridge:** Events API inbound (HMAC-verified; verification disabled with a loud warning if `SLACK_SIGNING_SECRET` is empty), `chat.postMessage` outbound. Slack threads round-trip via `meta.thread` (`"<channel>:<ts>"`); topic mirroring skips the bridge's own messages to prevent loops. Deliberately stdlib-only — no websockets/Socket Mode.
-- **Self-documenting:** `GET /docs` serves agent-oriented usage docs (the `docsMarkdown` constant in main.go) — new agents are onboarded by pointing them at that URL plus a token. Keep those docs in sync with any API change.
-- **Clients:** `bus.sh` at the repo root is a POSIX-sh curl/jq wrapper over the API; keep its commands in sync too. `dev-container.sh` passes host `AGENT_BUS_URL`/`AGENT_BUS_TOKEN` env vars into containers.
+`bus.sh` is a POSIX-sh curl/jq wrapper over the **agent-bus** HTTP API (the bus service now lives in its own repo at `../agent-bus`). It reads `AGENT_BUS_URL`/`AGENT_BUS_TOKEN` from the environment; `dev-container.sh` passes both into the containers it launches when they are set on the host. Keep its commands in sync with the bus API.
 
 ## Other contents
 

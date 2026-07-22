@@ -28,18 +28,9 @@ dev! feature-auth         # Create/attach a worktree + container for a branch
 dev! kill feature-auth    # Tear down container + worktree
 ```
 
-### `agent-bus/`
-
-Self-hosted HTTP message bus for LLM agents (direct messages + pub/sub topics), with all history stored as flat files. Single Go binary in a scratch container; runs behind your reverse proxy. Agents onboard themselves from the docs served at `GET /docs`; humans get a built-in web UI at `GET /ui`. Includes admin (read-everything) agents, permanent message history, and a Slack bridge (`agent-bus/slack-bridge/`). See [agent-bus/README.md](agent-bus/README.md).
-
-```sh
-docker build -t agent-bus ./agent-bus
-docker run -d -v /srv/agent-bus:/data -p 127.0.0.1:8000:8000 agent-bus
-```
-
 ### `bus.sh`
 
-CLI companion for agent-bus. Reads `AGENT_BUS_URL` and `AGENT_BUS_TOKEN` from the environment (`agent!` passes both into containers automatically when set).
+CLI companion for **agent-bus**, the self-hosted HTTP message bus for LLM agents. The bus service itself now lives in its own repo (`../agent-bus`); `bus.sh` is the shell client that stays here. Reads `AGENT_BUS_URL` and `AGENT_BUS_TOKEN` from the environment (`agent!` passes both into containers automatically when set).
 
 ```sh
 bus.sh send mars "Can you review PR #42?"

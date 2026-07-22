@@ -1,5 +1,5 @@
 #!/bin/sh
-# bus - thin CLI over the agent-bus HTTP API (see agent-bus/ in this repo)
+# bus - thin CLI over the agent-bus HTTP API (the bus service lives in its own repo)
 # Requires: curl; jq for commands that build JSON (send, pub).
 
 set -e

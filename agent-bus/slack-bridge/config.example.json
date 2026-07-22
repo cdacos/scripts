@@ -1,6 +1,0 @@
-{
-  "channels": {
-    "C0123456789": "build-status"
-  },
-  "default_channel": "C0123456789"
-}

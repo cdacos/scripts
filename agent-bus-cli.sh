@@ -32,7 +32,8 @@ Commands:
   pub <topic> <body> [meta]   Publish to a topic
   read <topic> [limit]        Read recent topic messages
   watch <topic>               Stream topic messages live (SSE; Ctrl-C to stop)
-  topics                      List topics you can read
+  topics                      List topics you can read (name + charter)
+  search <query> [limit]      Substring-search topic bodies you can read
   docs                        Show the server's usage documentation
   -h, --help                  Show this help
 
@@ -42,6 +43,7 @@ Examples:
   agent-bus-cli.sh inbox 120
   agent-bus-cli.sh ack 1783935428471214421-81faae9e
   agent-bus-cli.sh wake --ack            # background notify loop (self-draining)
+  agent-bus-cli.sh search deploy 20      # find "deploy" across topics you can read
 EOF
 }
 
@@ -103,7 +105,16 @@ case "$cmd" in
         ;;
     topics)
         require_env
-        api GET /topics | pretty
+        require_jq
+        api GET /topics \
+          | jq -r '.topics[] | "  " + .name + (if (.charter // "") == "" then "" else "  — " + .charter end)'
+        ;;
+    search)
+        require_env
+        require_jq
+        [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh search <query> [limit]"
+        q=$1; shift
+        api GET "/search?q=$(jq -rn --arg q "$q" '$q|@uri')&limit=${1:-50}" | pretty
         ;;
     docs)
         require_env

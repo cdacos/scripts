@@ -1,13 +1,18 @@
 #!/bin/sh
 # agent-bus-monitor-guard.sh - Claude Code Stop-hook guard for agent-bus monitor
-# agents. Wired from ~/.claude/settings.json's Stop hook, which gates it on
-# AGENT_BUS_TOKEN (presence of a bus identity) so it only runs for sessions that
-# are actually on the bus -- fleet agents always carry the token; the host
-# user's ordinary dev sessions do not. It refuses to let such a session go idle
-# unless an
+# agents. It refuses to let a bus session go idle unless an
 # `agent-bus-cli.sh wake` background task is running, keeping the real-time
 # inbox channel armed. Reads the hook JSON on stdin. Self-contained (no deps
 # on other files in this repo); install it on PATH beside agent-bus-cli.sh.
+#
+# Self-gating: exits silently unless AGENT_BUS_TOKEN is set (presence of a bus
+# identity) so it only guards sessions actually on the bus -- fleet agents
+# always carry the token; the host user's ordinary dev sessions do not. This
+# keeps ~/.claude/settings.json a dumb dispatcher (`agent-bus-monitor-guard.sh`
+# bare), same pattern as `agent-bus-cli.sh onboard`.
+
+# Off the bus -> no monitor to guard; allow the stop.
+[ -n "${AGENT_BUS_TOKEN:-}" ] || exit 0
 
 input=$(cat 2>/dev/null)
 

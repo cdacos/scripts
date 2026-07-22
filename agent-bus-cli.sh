@@ -29,6 +29,9 @@ Commands:
                               --ack you MUST ack every message before re-arming.
   history [agent] [limit]     Your DM history, optionally with one agent
   audit <agent> [limit]       Another agent's history (requires admin)
+  put-file <path> [ctype]     Upload a file as a blob; prints {id,size,...}
+  get-file <id> [out]         Download a blob by id (default: stdout)
+  send-file <agent> <path> [note]  Upload a file and DM its reference to an agent
   pub <topic> <body> [meta]   Publish to a topic
   read <topic> [limit]        Read recent topic messages
   watch <topic>               Stream topic messages live (SSE; Ctrl-C to stop)
@@ -46,6 +49,7 @@ Examples:
   agent-bus-cli.sh ack 1783935428471214421-81faae9e
   agent-bus-cli.sh wake --ack            # background notify loop (self-draining)
   agent-bus-cli.sh search deploy 20      # find "deploy" across topics you can read
+  agent-bus-cli.sh send-file mars ./report.pdf "review please"  # upload + DM ref
 EOF
 }
 
@@ -257,6 +261,47 @@ case "$cmd" in
         require_env
         [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh watch <topic>"
         curl -sSN -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" "${AGENT_BUS_URL}/topics/$1/watch"
+        ;;
+    put-file)
+        # Upload a file's bytes as a content-addressed blob. Prints {id,size,...};
+        # the id is the sha256 of the contents. Reference the id from a message.
+        require_env
+        [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh put-file <path> [content-type]"
+        [ -f "$1" ] || error "no such file: $1"
+        api POST /blobs -H "Content-Type: ${2:-application/octet-stream}" --data-binary "@$1" | pretty
+        ;;
+    get-file)
+        # Download a blob by id. Streams to stdout, or to a file if given (the
+        # ?name= makes the server suggest that filename, harmless for -o).
+        require_env
+        [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh get-file <id> [output-path]"
+        if [ -n "${2:-}" ]; then
+            api GET "/blobs/$1?name=$(basename "$2")" -o "$2" && printf 'saved %s\n' "$2"
+        else
+            api GET "/blobs/$1"
+        fi
+        ;;
+    send-file)
+        # Upload a file, then DM the recipient a message referencing the blob in
+        # meta ({kind:file, blob, name, size, content_type}) — the idiomatic way
+        # to "send a file": bytes go to the blob store, the tiny ref rides the DM.
+        require_env
+        require_jq
+        [ -n "${1:-}" ] && [ -n "${2:-}" ] || error "Usage: agent-bus-cli.sh send-file <agent> <path> [note] [content-type]"
+        target=$1
+        path=$2
+        [ -f "$path" ] || error "no such file: $path"
+        ctype=${4:-application/octet-stream}
+        resp=$(api POST /blobs -H "Content-Type: $ctype" --data-binary "@$path")
+        id=$(printf '%s' "$resp" | jq -r '.id // empty')
+        size=$(printf '%s' "$resp" | jq -r '.size // 0')
+        [ -n "$id" ] || error "upload failed: $resp"
+        name=$(basename "$path")
+        note=${3:-"sent file: $name"}
+        meta=$(jq -n --arg blob "$id" --arg name "$name" --argjson size "$size" --arg ct "$ctype" \
+            '{kind:"file", blob:$blob, name:$name, size:$size, content_type:$ct}')
+        body_json=$(payload "$note" "$meta")
+        api POST "/agents/$target/inbox" -d "$body_json" | pretty
         ;;
     *)
         error "Unknown command: $cmd (try --help)"

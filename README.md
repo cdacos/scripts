@@ -28,16 +28,16 @@ dev! feature-auth         # Create/attach a worktree + container for a branch
 dev! kill feature-auth    # Tear down container + worktree
 ```
 
-### `bus.sh`
+### `agent-bus-cli.sh`
 
-CLI companion for **agent-bus**, the self-hosted HTTP message bus for LLM agents. The bus service itself now lives in its own repo (`../agent-bus`); `bus.sh` is the shell client that stays here. Reads `AGENT_BUS_URL` and `AGENT_BUS_TOKEN` from the environment (`agent!` passes both into containers automatically when set).
+CLI companion for **agent-bus**, the self-hosted HTTP message bus for LLM agents. The bus service itself now lives in its own repo (`../agent-bus`); `agent-bus-cli.sh` is the shell client that stays here. Reads `AGENT_BUS_URL` and `AGENT_BUS_TOKEN` from the environment (`agent!` passes both into containers automatically when set).
 
 ```sh
-bus.sh send mars "Can you review PR #42?"
-bus.sh inbox 120          # long-poll up to 120s
-bus.sh ack <message-id>
-bus.sh pub build-status "green"
-bus.sh watch build-status
+agent-bus-cli.sh send mars "Can you review PR #42?"
+agent-bus-cli.sh inbox 120          # long-poll up to 120s
+agent-bus-cli.sh ack <message-id>
+agent-bus-cli.sh pub build-status "green"
+agent-bus-cli.sh watch build-status
 ```
 
 ### `check-tools.sh`
@@ -73,9 +73,9 @@ Add to your `.chezmoiexternal.toml`:
     executable = true
     refreshPeriod = "0"
 
-[".local/bin/bus.sh"]
+[".local/bin/agent-bus-cli.sh"]
     type = "file"
-    url = "https://raw.githubusercontent.com/cdacos/scripts/main/bus.sh"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-bus-cli.sh"
     executable = true
     refreshPeriod = "0"
 ```
@@ -88,6 +88,6 @@ Then run `chezmoi apply`.
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/agent-container.sh -o ~/.local/bin/agent-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/dev-container.sh -o ~/.local/bin/dev-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/check-tools.sh -o ~/.local/bin/check-tools.sh
-curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/bus.sh -o ~/.local/bin/bus.sh
-chmod +x ~/.local/bin/agent-container.sh ~/.local/bin/dev-container.sh ~/.local/bin/check-tools.sh ~/.local/bin/bus.sh
+curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/agent-bus-cli.sh -o ~/.local/bin/agent-bus-cli.sh
+chmod +x ~/.local/bin/agent-container.sh ~/.local/bin/dev-container.sh ~/.local/bin/check-tools.sh ~/.local/bin/agent-bus-cli.sh
 ```

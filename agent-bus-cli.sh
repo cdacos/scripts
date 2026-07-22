@@ -6,7 +6,7 @@ set -e
 
 show_help() {
     cat <<'EOF'
-Usage: bus.sh <command> [args]
+Usage: agent-bus-cli.sh <command> [args]
 
 Talks to an agent-bus server. Requires environment variables:
   AGENT_BUS_URL     Base URL of the bus (e.g. https://bus.example.com)
@@ -18,6 +18,15 @@ Commands:
   send <agent> <body> [meta]  Send a direct message (meta = JSON object)
   inbox [wait-seconds]        List pending messages; optionally long-poll
   ack <message-id>            Acknowledge (remove) an inbox message
+  ack-all                     Acknowledge every pending inbox message
+  wake [wait] [--ack]         Block until mail arrives, print it, and exit --
+                              for a background notify loop. The server only
+                              long-polls on an EMPTY inbox, so a re-armed wake
+                              returns un-acked messages instantly and spins.
+                              Pass --ack to drain each delivered message before
+                              exiting, so the next wake meets an empty inbox and
+                              genuinely blocks (loop-proof, at-most-once). Without
+                              --ack you MUST ack every message before re-arming.
   history [agent] [limit]     Your DM history, optionally with one agent
   audit <agent> [limit]       Another agent's history (requires admin)
   pub <topic> <body> [meta]   Publish to a topic
@@ -28,10 +37,11 @@ Commands:
   -h, --help                  Show this help
 
 Examples:
-  bus.sh send mars "Can you review PR #42?"
-  bus.sh send mars "build info" '{"repo":"scripts","run":17}'
-  bus.sh inbox 120
-  bus.sh ack 1783935428471214421-81faae9e
+  agent-bus-cli.sh send mars "Can you review PR #42?"
+  agent-bus-cli.sh send mars "build info" '{"repo":"scripts","run":17}'
+  agent-bus-cli.sh inbox 120
+  agent-bus-cli.sh ack 1783935428471214421-81faae9e
+  agent-bus-cli.sh wake --ack            # background notify loop (self-draining)
 EOF
 }
 
@@ -43,6 +53,8 @@ error() {
 require_env() {
     [ -n "$AGENT_BUS_URL" ] || error "AGENT_BUS_URL is not set"
     [ -n "$AGENT_BUS_TOKEN" ] || error "AGENT_BUS_TOKEN is not set"
+    # Normalise: a trailing slash would yield //path (breaks routing/JSON).
+    AGENT_BUS_URL="${AGENT_BUS_URL%/}"
 }
 
 require_jq() {
@@ -100,7 +112,7 @@ case "$cmd" in
     send)
         require_env
         require_jq
-        [ -n "${1:-}" ] && [ -n "${2:-}" ] || error "Usage: bus.sh send <agent> <body> [meta-json]"
+        [ -n "${1:-}" ] && [ -n "${2:-}" ] || error "Usage: agent-bus-cli.sh send <agent> <body> [meta-json]"
         body_json=$(payload "$2" "${3:-}")
         api POST "/agents/$1/inbox" -d "$body_json" | pretty
         ;;
@@ -114,8 +126,55 @@ case "$cmd" in
         ;;
     ack)
         require_env
-        [ -n "${1:-}" ] || error "Usage: bus.sh ack <message-id>"
+        [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh ack <message-id>"
         api DELETE "/inbox/$1" | pretty
+        ;;
+    ack-all)
+        require_env
+        require_jq
+        # Drain the whole pending set in one shot. Handy for cleanup and for the
+        # ack-then-rearm discipline the wake loop depends on.
+        n=0
+        for id in $(api GET /inbox | jq -r '.messages[].id'); do
+            api DELETE "/inbox/$id" >/dev/null && n=$((n + 1))
+        done
+        printf 'acked %d message(s)\n' "$n"
+        ;;
+    wake)
+        require_env
+        require_jq
+        # Block until a message arrives, print it, and exit -- so a harness
+        # background task re-invokes the agent only on real mail. The server
+        # long-polls ONLY on an empty inbox (main.go: `if len(msgs)==0 && wait`),
+        # so any un-acked message makes wait=N return instantly. That is why a
+        # naive re-armed poll spins. --ack drains each delivered message before
+        # exiting, guaranteeing the next wake meets an empty inbox and blocks.
+        wait=120
+        ackmode=0
+        for a in "$@"; do
+            case "$a" in
+                --ack) ackmode=1 ;;
+                *[!0-9]*) : ;; # ignore non-numeric args
+                ?*) wait="$a" ;;
+            esac
+        done
+        while true; do
+            resp=$(curl -sS -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" \
+                "${AGENT_BUS_URL}/inbox?wait=${wait}" 2>/dev/null) || {
+                sleep 2
+                continue
+            }
+            count=$(printf '%s' "$resp" | jq '.messages | length' 2>/dev/null || echo 0)
+            [ "${count:-0}" -gt 0 ] || continue
+            printf '%s\n' "$resp" | jq .
+            if [ "$ackmode" -eq 1 ]; then
+                for id in $(printf '%s' "$resp" | jq -r '.messages[].id'); do
+                    curl -sS -X DELETE -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" \
+                        "${AGENT_BUS_URL}/inbox/${id}" >/dev/null 2>&1 || true
+                done
+            fi
+            exit 0
+        done
         ;;
     history)
         require_env
@@ -128,24 +187,24 @@ case "$cmd" in
         ;;
     audit)
         require_env
-        [ -n "${1:-}" ] || error "Usage: bus.sh audit <agent> [limit]"
+        [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh audit <agent> [limit]"
         api GET "/agents/$1/history?limit=${2:-50}" | pretty
         ;;
     pub)
         require_env
         require_jq
-        [ -n "${1:-}" ] && [ -n "${2:-}" ] || error "Usage: bus.sh pub <topic> <body> [meta-json]"
+        [ -n "${1:-}" ] && [ -n "${2:-}" ] || error "Usage: agent-bus-cli.sh pub <topic> <body> [meta-json]"
         body_json=$(payload "$2" "${3:-}")
         api POST "/topics/$1" -d "$body_json" | pretty
         ;;
     read)
         require_env
-        [ -n "${1:-}" ] || error "Usage: bus.sh read <topic> [limit]"
+        [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh read <topic> [limit]"
         api GET "/topics/$1?limit=${2:-50}" | pretty
         ;;
     watch)
         require_env
-        [ -n "${1:-}" ] || error "Usage: bus.sh watch <topic>"
+        [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh watch <topic>"
         curl -sSN -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" "${AGENT_BUS_URL}/topics/$1/watch"
         ;;
     *)

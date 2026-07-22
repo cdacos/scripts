@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository purpose
 
-Standalone developer utility shell scripts, distributed as single files via raw GitHub URLs (users install them with chezmoi externals or curl — see README.md). Each script must therefore remain **self-contained in one file** with no dependencies on other files in this repo. (`bus.sh` is the shell client for the **agent-bus** service, which now lives in its own repo at `../agent-bus`.)
+Standalone developer utility shell scripts, distributed as single files via raw GitHub URLs (users install them with chezmoi externals or curl — see README.md). Each script must therefore remain **self-contained in one file** with no dependencies on other files in this repo. (`agent-bus-cli.sh` is the shell client for the **agent-bus** service, which now lives in its own repo at `../agent-bus`.)
 
 ## Commands
 
 There is no test framework. Lint and format shell scripts with:
 
 ```sh
-shellcheck dev-container.sh dev-container-per-repo.sh check-tools.sh bus.sh
+shellcheck dev-container.sh dev-container-per-repo.sh check-tools.sh agent-bus-cli.sh agent-bus-monitor-guard.sh
 shfmt -d .          # diff formatting issues (shfmt -w to fix)
 ```
 
@@ -47,9 +47,9 @@ The main script. `dev! <name> [folder] [--save|--only] [--keep-alive] [--docker]
 - **Isolation stance** (stated honestly in `--help`): the container sees only its saved folder set (or, with `--only`, the single passed folder) + its claude dir — but the saved set grows on every `--save`, so a long-lived container's reach is whatever has accumulated (`ls -l <name>/mounts`). Network is **not** isolated. `docker.sock` is **not** mounted unless `--docker` is passed — it grants root-equivalent host access (on macOS the whole Docker VM), so it is opt-in.
 - **Dockerfile ownership**: each container owns exactly one Dockerfile at `$STATE_HOME/<name>/Dockerfile`, built with context `$STATE_HOME/<name>/` (a generated `.dockerignore` (kept up to date via `ensure_dockerignore`, which appends newer entries to pre-existing files) keeps that dir's `.env`/`port`/`folder`/`fullname`/`mounts`/`.build-sig`/`claude` state and secrets out of the build context). `write_default_dockerfile` writes a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux, and the creds-injecting entrypoint) there on first create (past the confirm gate, so an aborted create leaves no state) — the script is distributed standalone, so this default is **embedded as a heredoc** rather than read from disk, and it is the single source for this repo's own dev container too (edit the heredoc to change it). The Dockerfile is **bind-mounted rw at `~/Dockerfile`** (the login user's home) so the container can edit its own build recipe; edits take effect on the next recreate. The target folder's own Dockerfiles are **ignored** — crib from them by hand. There is no `dev! init` and no per-folder `Dockerfile.dev`. Its only hard requirement is a login user with bash (named `DEV_USER`, defaulting to the container name — see **Named identity**), created with `HOST_UID`/`HOST_GID` build args for volume permission parity.
 
-## Architecture: bus.sh
+## Architecture: agent-bus-cli.sh
 
-`bus.sh` is a POSIX-sh curl/jq wrapper over the **agent-bus** HTTP API (the bus service now lives in its own repo at `../agent-bus`). It reads `AGENT_BUS_URL`/`AGENT_BUS_TOKEN` from the environment; `dev-container.sh` passes both into the containers it launches when they are set on the host. Keep its commands in sync with the bus API.
+`agent-bus-cli.sh` is a POSIX-sh curl/jq wrapper over the **agent-bus** HTTP API (the bus service now lives in its own repo at `../agent-bus`). It reads `AGENT_BUS_URL`/`AGENT_BUS_TOKEN` from the environment; `dev-container.sh` passes both into the containers it launches when they are set on the host. Keep its commands in sync with the bus API.
 
 ## Other contents
 

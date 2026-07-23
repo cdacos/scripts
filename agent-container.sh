@@ -23,6 +23,14 @@ STATE_HOME="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
 # agent makes itself. Space-separated, relative to the login user's home.
 PERSIST_DIRS=".ssh src"
 
+# DNS resolvers for agent containers (space-separated), passed as `docker run --dns`.
+# Defaults to public resolvers: Docker Desktop's embedded forwarder (192.168.65.7)
+# intermittently returns empty answers for external names, which silently breaks the
+# agent-bus and chezmoi's raw.githubusercontent.com external fetches. Override via the
+# AGENT_DNS env var — e.g. keep an internal resolver too with
+# AGENT_DNS="1.1.1.1 8.8.8.8 192.168.65.7", or AGENT_DNS="" to leave resolv.conf as-is.
+AGENT_DNS=${AGENT_DNS-"1.1.1.1 8.8.8.8"}
+
 show_help() {
 	cat <<'EOF'
 Usage: agent! [name] [folder] [--save|--only] [--fork] [--keep-alive] [--port H:C] [--docker]
@@ -1040,6 +1048,11 @@ run_container() {
 		--name "agent-$name" \
 		-e "CLAUDE_CODE_CREDENTIALS=${claude_creds}" \
 		-e "CLAUDE_JSON=${claude_json}"
+
+	# Reliable resolvers ahead of Docker's embedded DNS (see AGENT_DNS above).
+	for dns in $AGENT_DNS; do
+		set -- "$@" --dns "$dns"
+	done
 
 	oldifs=$IFS
 	IFS='

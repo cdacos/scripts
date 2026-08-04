@@ -27,6 +27,8 @@ Commands:
                               exiting, so the next wake meets an empty inbox and
                               genuinely blocks (loop-proof, at-most-once). Without
                               --ack you MUST ack every message before re-arming.
+                              Exits by itself if the session that armed it dies,
+                              so an orphaned loop cannot ack mail into a void.
   history [agent] [limit]     Your DM history, optionally with one agent
   audit <agent> [limit]       Another agent's history (requires admin)
   put-file <path> [ctype]     Upload a file as a blob; prints {id,size,...}
@@ -213,7 +215,24 @@ case "$cmd" in
                 ?*) wait="$a" ;;
             esac
         done
+        # Ghost monitors: if the agent session that armed this loop dies, the
+        # harness's `sh -c` wrapper is reparented to init but the loop keeps
+        # long-polling -- and since --ack drains on delivery, a ghost ACKS a DM
+        # that no agent will ever read. The message survives in history; the
+        # notification does not. So record the supervisor (the session that
+        # spawned our wrapper -- $PPID is the wrapper, its parent is the
+        # session) and stop once it is gone. An absent or init supervisor means
+        # we were not launched under one (manual/nohup use): police nothing.
+        supervisor=$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ' || true)
+        case "$supervisor" in
+            '' | 0 | 1) supervisor='' ;;
+        esac
         while true; do
+            if [ -n "$supervisor" ] && ! ps -p "$supervisor" >/dev/null 2>&1; then
+                printf 'wake: session %s has gone; exiting rather than acking mail nobody will read.\n' \
+                    "$supervisor" >&2
+                exit 0
+            fi
             resp=$(curl -sS -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" \
                 "${AGENT_BUS_URL}/inbox?wait=${wait}" 2>/dev/null) || {
                 sleep 2

@@ -31,5 +31,11 @@ fi
 # instruction on BOTH channels (reason + hookSpecificOutput.additionalContext):
 # sources disagree on which one a command-type Stop hook feeds to the model, and
 # carrying both is correct either way and harmless if one is ignored.
-printf '%s' '{"decision":"block","reason":"No agent-bus monitor is armed. Run: agent-bus-cli.sh wake --ack (as a background task), then you may stop.","hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"No agent-bus monitor is armed. Run agent-bus-cli.sh wake --ack as a background task, then re-arm before stopping."}}'
+#
+# Bare `wake`, never `--ack`: this message is where an agent that has lost the
+# thread learns the discipline, so it must not teach the lossy path. --ack
+# drains on delivery, which destroys a DM outright if the session dies before
+# handling it; the delivery cursor means an un-acked message no longer spins the
+# re-armed poll, so there is nothing left to trade for that risk.
+printf '%s' '{"decision":"block","reason":"No agent-bus monitor is armed. Run: agent-bus-cli.sh wake (as a background task), then you may stop. Do not pass --ack -- ack with ack-all once you have handled a message, never on delivery.","hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"No agent-bus monitor is armed. Run agent-bus-cli.sh wake as a background task, then re-arm before stopping. Do not pass --ack: it drains on delivery, so a session that dies mid-handle destroys the DM. Ack means handled -- run ack-all after you have acted."}}'
 exit 0

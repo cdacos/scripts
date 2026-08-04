@@ -11,7 +11,7 @@
 set -e
 
 # Bump this on user-visible behavior changes (see CLAUDE.md).
-VERSION="1.2"
+VERSION="1.3"
 
 # State home: per-name container state lives here. Override for testing.
 STATE_HOME="${AGENT_CONTAINER_HOME:-$HOME/.local/agent-container}"
@@ -1038,6 +1038,7 @@ run_container() {
 
 	set -- --init -d \
 		--name "agent-$name" \
+		--hostname "$name" \
 		-e "CLAUDE_CODE_CREDENTIALS=${claude_creds}" \
 		-e "CLAUDE_JSON=${claude_json}"
 

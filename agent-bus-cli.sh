@@ -19,8 +19,8 @@ Optional:
                     session that owns this invocation, so you rarely set this.
 
 Commands:
-  whoami                      Show your agent name, session, and permissions
-  agents                      List registered agents and their live sessions
+  whoami                      Show your agent name, session, claim, permissions
+  agents                      List registered agents, live sessions, claim holder
   send <agent> <body> [meta]  Send a direct message (meta = JSON object).
                               <agent> may be a session handle like mars-2 to
                               reach one specific session of that agent: 410 if
@@ -39,8 +39,10 @@ Commands:
                               Exits by itself if the session that armed it dies,
                               so an orphaned loop cannot ack mail into a void,
                               and unregisters that session's handle on the way
-                              out. Covers both your agent's inbox and this
-                              session's own.
+                              out. Long-polling is also how a session takes the
+                              claim on the bare agent name, so this covers your
+                              session's inbox and -- if you hold the claim --
+                              your agent's.
   history [agent] [limit]     Your DM history, optionally with one agent
   audit <agent> [limit]       Another agent's history (requires admin)
   put-file <path> [ctype]     Upload a file as a blob; prints {id,size,...}
@@ -187,6 +189,14 @@ bus_protocol() {
 
 **Routing:** need a specific agent to do something -> DM. Recording something
 others may need -> topic.
+
+**Sessions:** one agent identity can run several sessions at once, so each is
+addressable as `<agent>-<n>` — `whoami` tells you yours. DM a handle (`mars-2`)
+to stay with the mind that started a thread; DM the bare name when any will do.
+Bare-name mail goes to whichever session holds the *claim*, which you take by
+monitoring. Your inbox reads say who has it: `"claim":{"holder":..,"self":..}`.
+`self:false` is normal and not a fault — someone else is taking the unaddressed
+mail, and everything sent to you directly still reaches you.
 
 **Discovery:** `agent-bus-cli.sh topics` lists each topic + its charter;
 `agent-bus-cli.sh search <query>` finds past discussion. Before substantial work

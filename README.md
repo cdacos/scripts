@@ -40,6 +40,32 @@ agent-bus-cli.sh pub build-status "green"
 agent-bus-cli.sh watch build-status
 ```
 
+### `agent-bus-fsd.sh`
+
+Serves this box's `~/src` to the **agent-bus** web UI's Files tab. The bus runs
+elsewhere and cannot see your disk, so each agent serves its own: the daemon
+watches the `fs-req` topic over SSE, answers only requests addressed to its own
+agent name, and publishes replies to `fs-rsp`. Outbound connections only — no
+port to open, so it works from a NATed VM or a laptop container. Any holder of a
+valid bus token can browse; anonymous visitors to `/ui` cannot.
+
+Gitignored files and `.git` directories are withheld by default
+(`AGENT_BUS_FS_GITIGNORE=0` to serve everything). That is the layer worth
+guarding: anything committed is already on the remote, whereas gitignored files
+are where secrets live by convention — and a `.git` pack still holds secrets
+that were committed and later deleted. `.gitignore` itself stays readable.
+Tracked contents are otherwise served raw, so point `AGENT_BUS_FS_ROOT` only at
+a tree you would hand to every agent on the bus.
+
+`agent-bus-fsd.sh check` reports how many ignored files each repo is withholding,
+so you can see what you are exposing before you serve it.
+
+```sh
+agent-bus-fsd.sh check              # verify env, root and bus reachability
+agent-bus-fsd.sh serve &            # answer requests until killed
+AGENT_BUS_FS_ROOT=$HOME/work agent-bus-fsd.sh serve
+```
+
 ### `check-tools.sh`
 
 Checks for missing CLI tools and chezmoi configuration drift. Shows installation commands for your platform (brew/apt).
@@ -78,6 +104,12 @@ Add to your `.chezmoiexternal.toml`:
     url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-bus-cli.sh"
     executable = true
     refreshPeriod = "0"
+
+[".local/bin/agent-bus-fsd.sh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-bus-fsd.sh"
+    executable = true
+    refreshPeriod = "0"
 ```
 
 Then run `chezmoi apply`.
@@ -89,5 +121,6 @@ curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/agent-container
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/dev-container.sh -o ~/.local/bin/dev-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/check-tools.sh -o ~/.local/bin/check-tools.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/agent-bus-cli.sh -o ~/.local/bin/agent-bus-cli.sh
-chmod +x ~/.local/bin/agent-container.sh ~/.local/bin/dev-container.sh ~/.local/bin/check-tools.sh ~/.local/bin/agent-bus-cli.sh
+curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/agent-bus-fsd.sh -o ~/.local/bin/agent-bus-fsd.sh
+chmod +x ~/.local/bin/agent-container.sh ~/.local/bin/dev-container.sh ~/.local/bin/check-tools.sh ~/.local/bin/agent-bus-cli.sh ~/.local/bin/agent-bus-fsd.sh
 ```

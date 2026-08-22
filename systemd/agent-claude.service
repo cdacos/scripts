@@ -1,0 +1,30 @@
+[Unit]
+Description=Claude Code agent (supervised)
+Documentation=https://github.com/cdacos/scripts
+PartOf=agent.target
+Wants=network-online.target
+After=network-online.target
+# agent-run.sh exits non-zero when a stray claude already owns the box. Without
+# a start limit, Restart=always would spin on that forever; with one the unit
+# lands in `failed`, which is visible.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=TERM=xterm-256color
+# claude is a TUI and wants a controlling terminal, which a plain ExecStart has
+# not got. script(1) supplies a real pty and stays in the foreground, so systemd
+# supervises this process directly and Restart=always behaves. tmux nested inside
+# keeps `tmux -L agent attach` working for a human; the client holds that pty, so
+# when claude exits the session ends, the client exits, script exits, systemd
+# restarts.
+ExecStart=/usr/bin/script -qfec "/usr/bin/tmux -L agent new-session -A -s agent %h/.local/bin/agent-run.sh" /dev/null
+ExecStop=/usr/bin/tmux -L agent kill-server
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=agent.target

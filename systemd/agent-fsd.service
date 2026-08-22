@@ -1,0 +1,24 @@
+[Unit]
+Description=agent-bus file daemon
+Documentation=https://github.com/cdacos/scripts
+# Kept separate from agent-claude.service on purpose: a daemon crash must not
+# take the agent down, and the daemon can be restarted after a config change
+# without disturbing a working session.
+PartOf=agent.target
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+# agent-env.sh restores the agent's environment; EnvironmentFile cannot (it drops
+# `export K=v`) and a bare `bash -lc` sources nothing (~/.bashrc returns early when
+# non-interactive). Without it this unit exits 127.
+ExecStart=/bin/bash -lc '. "%h/.local/bin/agent-env.sh" || exit 127; exec agent-bus-fsd.sh serve'
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=agent.target

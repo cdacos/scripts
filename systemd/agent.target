@@ -1,0 +1,8 @@
+[Unit]
+Description=Fleet agent (Claude Code session + bus file daemon)
+Documentation=https://github.com/cdacos/scripts
+Wants=agent-claude.service agent-fsd.service
+After=default.target
+
+[Install]
+WantedBy=default.target

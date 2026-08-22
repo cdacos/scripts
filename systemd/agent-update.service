@@ -1,0 +1,10 @@
+[Unit]
+Description=Harness update check for the supervised agent
+Documentation=https://github.com/cdacos/scripts
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-update-check.sh
+TimeoutStartSec=15min

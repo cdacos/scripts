@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily harness update check for the supervised agent
+
+[Timer]
+Unit=agent-update.service
+OnBootSec=2min
+OnCalendar=daily
+# The fleet shares an upstream; do not have every VM fetch at the same instant.
+RandomizedDelaySec=30min
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

@@ -74,6 +74,49 @@ Checks for missing CLI tools and chezmoi configuration drift. Shows installation
 check-tools.sh
 ```
 
+### Agent supervision (`agent-supervision-install.sh`, `agent-run.sh`, `agent-env.sh`, `agent-update-check.sh`)
+
+Puts a fleet agent's `claude` session and its file daemon under `systemd --user`:
+started at boot, restarted on death, one per VM, and moved onto a new harness
+build without anyone remembering to do it.
+
+The reason this exists: `claude update` swaps a symlink, but the running process
+keeps its original inode, so **the restart is the update**. Measured on marvin
+2026-08-22 — the agent had been running 2.1.234 for a day while 2.1.238 sat
+installed on disk. Nothing supervised it and nothing would have noticed.
+
+| Unit | Does |
+| --- | --- |
+| `agent.target` | Groups the two, and is what `default.target` wants at boot. |
+| `agent-claude.service` | The agent. `script(1)` supplies the pty its TUI needs; `tmux -L agent` nests inside so a human can still `tmux -L agent attach`. |
+| `agent-fsd.service` | `agent-bus-fsd.sh serve`. Separate, so a daemon crash cannot take the agent down. |
+| `agent-update.timer` | Daily (plus 2 min after boot): `claude update`, prune old builds, and restart the agent **only when it is idle**. |
+
+Three things are worth knowing before adapting this:
+
+* **`loginctl enable-linger` is mandatory.** Without it a `--user` unit dies at
+  logout and never starts at boot.
+* **Neither `EnvironmentFile` nor `bash -lc` restores the agent's environment**,
+  and both fail silently — see the header of `agent-env.sh`, which is the one
+  place that solves it.
+* **The idle gate is deliberately approximate**: no un-acked bus mail, no
+  transcript written for 10 minutes, and near-zero CPU. It is allowed to be
+  imperfect because the bus's `ack` means *handled*, not *delivered* — a
+  badly-timed restart costs a repeated turn, not a dropped request. An armed
+  `agent-bus-cli.sh wake` is *not* an idle signal; the monitor stays armed while
+  the agent works.
+
+```sh
+agent-supervision-install.sh            # linger, enable units, migrate the daemon
+agent-supervision-install.sh status     # what is running, and has it drifted?
+agent-supervision-install.sh cutover    # hand a hand-started tmux agent to systemd
+```
+
+Per-box overrides go in `~/.config/agent/run.conf` (`AGENT_NAME`,
+`AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_START_PROMPT`, `AGENT_UPDATE_MODE`,
+`AGENT_IDLE_QUIET_SECS`, `AGENT_KEEP_VERSIONS`). Set `AGENT_UPDATE_MODE=notify`
+on a box that should report drift and never act on it.
+
 ## Install
 
 ### With chezmoi
@@ -110,9 +153,60 @@ Add to your `.chezmoiexternal.toml`:
     url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-bus-fsd.sh"
     executable = true
     refreshPeriod = "0"
+
+[".local/bin/agent-env.sh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-env.sh"
+    executable = true
+    refreshPeriod = "0"
+
+[".local/bin/agent-run.sh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-run.sh"
+    executable = true
+    refreshPeriod = "0"
+
+[".local/bin/agent-update-check.sh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-update-check.sh"
+    executable = true
+    refreshPeriod = "0"
+
+[".local/bin/agent-supervision-install.sh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-supervision-install.sh"
+    executable = true
+    refreshPeriod = "0"
+
+[".config/systemd/user/agent.target"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/systemd/agent.target"
+    refreshPeriod = "0"
+
+[".config/systemd/user/agent-claude.service"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/systemd/agent-claude.service"
+    refreshPeriod = "0"
+
+[".config/systemd/user/agent-fsd.service"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/systemd/agent-fsd.service"
+    refreshPeriod = "0"
+
+[".config/systemd/user/agent-update.service"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/systemd/agent-update.service"
+    refreshPeriod = "0"
+
+[".config/systemd/user/agent-update.timer"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/systemd/agent-update.timer"
+    refreshPeriod = "0"
 ```
 
-Then run `chezmoi apply`.
+Then run `chezmoi apply`. Unit files changing on disk do not reload themselves;
+`agent-update-check.sh` runs `systemctl --user daemon-reload` on every tick, so
+a chezmoi-delivered unit change is picked up within a day.
 
 ### Standalone
 

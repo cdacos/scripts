@@ -27,6 +27,20 @@ cmd_install() {
     [ -x "$HOME/.local/bin/agent-run.sh" ] || die "agent-run.sh not on ~/.local/bin -- run chezmoi apply first"
     [ -f "$HOME/.config/systemd/user/agent-claude.service" ] || die "units not installed -- run chezmoi apply first"
 
+    # The units are the only thing that ever executes agent-env.sh, so this is the
+    # one moment where a stale common.sh matters. The agent-env.sh external entry
+    # was added to the shared dotfiles (b73f749) THIRTEEN MINUTES before the guard
+    # that makes it safe (ef27efa), so a box that pulled in between -- or that
+    # applies without pulling -- holds the external while its common.sh still runs
+    # the daily check unconditionally. Such a box silently eats the human's daily
+    # tool-and-drift report and shows nothing anywhere a person would look.
+    # `chezmoi apply` does not pull; `chezmoi update` does. Check, do not assume.
+    envfile="${AGENT_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/shell/common.sh}"
+    if [ -r "$envfile" ] && grep -q '_daily_check' "$envfile" &&
+       ! grep -qE 'case .*_daily_check' "$envfile"; then
+        die "$envfile calls _daily_check unconditionally. Run 'chezmoi update' (pull AND apply -- plain 'chezmoi apply' will not do it) before installing, or this box will silently consume the daily tool-and-drift check."
+    fi
+
     # A --user unit dies at logout and never starts at boot without this.
     if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
         log "enabling linger for $(id -un)"

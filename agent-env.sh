@@ -34,6 +34,18 @@
 
 AGENT_ENV_FILE="${AGENT_ENV_FILE:-$HOME/.config/shell/common.sh}"
 
+# REDUNDANT ONCE THE GUARD IS FLEET-WIDE -- AND DELIBERATELY STILL HERE.
+# common.sh now runs its daily check in interactive shells only (cdacos/dotfiles
+# ef27efa), which fixes this at the source and makes everything in this block a
+# no-op. It is not removed yet because the two halves travel by different roads:
+# agent-env.sh ships as a chezmoi *external*, refetched from GitHub on nearly
+# every apply, while common.sh is a managed file served from the box's local
+# source clone. A box that runs `chezmoi apply` without pulling therefore gets
+# the new agent-env.sh beside an old, unguarded common.sh. Deleting this first
+# would silently restore the original bug on exactly the boxes slowest to update,
+# and silently is the whole problem. Remove once marvin, speedy and tweety have
+# each confirmed the guarded common.sh. (Ordering hazard spotted by Tweety.)
+#
 # --- borrow the daily-check stamp, then give it back ------------------------
 # Two guards, because the harm is invisible from the human side by construction:
 #

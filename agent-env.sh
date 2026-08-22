@@ -34,15 +34,51 @@
 
 AGENT_ENV_FILE="${AGENT_ENV_FILE:-$HOME/.config/shell/common.sh}"
 
-# Borrow the daily-check stamp, then give it back untouched.
+# --- borrow the daily-check stamp, then give it back ------------------------
+# Two guards, because the harm is invisible from the human side by construction:
+#
+#   flock  agent.target starts agent-claude and agent-fsd together, so two
+#          agent-env.sh instances race at every boot. Unlocked they interleave --
+#          A pins, B reads the pinned value as "original", A restores, B restores
+#          the pin -- and the stamp is left claimed for good. Not hypothetical:
+#          that is the normal boot path.
+#   trap   a death between pin and restore (OOM, systemd stop, a failing source)
+#          would leave the stamp pinned, reintroducing the exact failure this
+#          designs out, on the error path where nobody looks.
+#
+# Honest limit: the lock only serialises agent-env.sh against itself. A human's
+# interactive shell reaches common.sh through ~/.bashrc and takes no lock, so a
+# shell started inside the pinned window still short-circuits. That window is
+# milliseconds and closing it would mean editing a shared dotfile, so it is left
+# open deliberately rather than by oversight. (Residual raised by Tweety.)
 _ae_stamp="$HOME/.cache/daily_check_stamp"
+_ae_done=0
+
+_ae_restore_stamp() {
+    [ "$_ae_done" = 1 ] && return 0
+    _ae_done=1
+    if [ "$_ae_had" = 1 ]; then
+        printf '%s\n' "$_ae_was" > "$_ae_stamp" 2>/dev/null || true
+    else
+        rm -f "$_ae_stamp" 2>/dev/null || true
+    fi
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+}
+
+mkdir -p "$HOME/.cache" 2>/dev/null || true
+exec 9>"$HOME/.cache/.daily_check_stamp.lock" 2>/dev/null || true
+flock -w 5 9 2>/dev/null || true
+
 if [ -f "$_ae_stamp" ]; then
     _ae_had=1; _ae_was=$(cat "$_ae_stamp" 2>/dev/null || true)
 else
     _ae_had=0; _ae_was=""
 fi
-mkdir -p "$HOME/.cache" 2>/dev/null || true
 date +%j > "$_ae_stamp" 2>/dev/null || true
+
+_ae_prev_trap=$(trap -p EXIT 2>/dev/null)
+trap '_ae_restore_stamp' EXIT INT TERM HUP
 
 if [ -r "$AGENT_ENV_FILE" ]; then
     # Output to stderr: it belongs in the journal, never in the supervised
@@ -52,12 +88,11 @@ else
     echo "agent-env: no $AGENT_ENV_FILE -- falling back to PATH only" >&2
 fi
 
-if [ "$_ae_had" = 1 ]; then
-    printf '%s\n' "$_ae_was" > "$_ae_stamp" 2>/dev/null || true
-else
-    rm -f "$_ae_stamp" 2>/dev/null || true
-fi
-unset _ae_stamp _ae_had _ae_was
+_ae_restore_stamp
+trap - EXIT INT TERM HUP
+[ -n "$_ae_prev_trap" ] && eval "$_ae_prev_trap"
+unset _ae_stamp _ae_had _ae_was _ae_done _ae_prev_trap
+unset -f _ae_restore_stamp
 
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;

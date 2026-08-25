@@ -128,6 +128,14 @@ require_env() {
     RG_BIN=$(grep_binary rg || true)
     GIT_BIN=$(grep_binary git || true)
     TIMEOUT_BIN=$(grep_binary timeout || true)
+    if rg_usable; then
+        RG_OK=1
+    else
+        RG_OK=0
+        if [ -n "$RG_BIN" ]; then
+            log "rg at $RG_BIN did not produce the expected field format; using $(grep_engine) instead"
+        fi
+    fi
 
     # Fail closed and loudly at startup rather than quietly serving everything:
     # a control that silently stops applying is worse than one that was never on.
@@ -573,8 +581,34 @@ grep_binary() {
     esac
 }
 
+# rg_usable -- does this ripgrep actually emit the three fields the parser
+# needs? Proved against a synthetic file at startup rather than inferred from a
+# version number.
+#
+# This exists because the -I mistake above cost nothing at all to make and
+# produced no error: rg exited 0, wrote output, and every row was silently
+# discarded downstream. A flag whose meaning shifts under us -- across a major
+# version, a distro patch, or a user's RIPGREP_CONFIG_PATH -- must fail loudly
+# here and fall back to git, not return "no matches" for a file that has them.
+rg_usable() {
+    [ -n "$RG_BIN" ] || return 1
+    _pd=$(mktemp -d "${TMPDIR:-/tmp}/agent-bus-fsd-probe.XXXXXX") || return 1
+    printf 'alpha\nbeta gamma\n' >"$_pd/probe.txt"
+    # RIPGREP_CONFIG_PATH is cleared for the probe and for every real search, so
+    # a user's config file cannot bend the output format under us.
+    _po=$(cd "$_pd" 2>/dev/null && RIPGREP_CONFIG_PATH= "$RG_BIN" \
+        --no-heading --line-number --with-filename --color never --smart-case \
+        --fixed-strings --field-match-separator "$TAB" -e 'beta' -- . 2>/dev/null |
+        head -n 1)
+    rm -rf "$_pd"
+    case "$_po" in
+        "./probe.txt${TAB}2${TAB}beta gamma" | "probe.txt${TAB}2${TAB}beta gamma") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 grep_engine() {
-    if [ -n "$RG_BIN" ]; then
+    if [ "$RG_OK" = 1 ]; then
         printf 'rg\n'
     elif [ -n "$GIT_BIN" ]; then
         printf 'git\n'
@@ -610,12 +644,16 @@ grep_icase_flag() {
 # absolute prefix with sed would not be, since a directory name may hold
 # characters sed reads as syntax.
 
+# No -I here, deliberately. It means "skip binary files" to grep(1) but
+# "--no-filename" to ripgrep, which stripped the path off every row and left the
+# parser dropping all of them -- a search that returned zero while looking
+# perfectly healthy. ripgrep skips binary content by default anyway.
 grep_run_rg() {
-    _o="--no-heading --line-number --with-filename --color never -I --hidden --smart-case"
+    _o="--no-heading --line-number --with-filename --color never --hidden --smart-case"
     if [ "$3" != true ]; then _o="$_o --fixed-strings"; fi
     if [ "$GITIGNORE" != 1 ]; then _o="$_o --no-ignore"; fi
     # shellcheck disable=SC2086
-    (cd "$1" 2>/dev/null && run_bounded "$RG_BIN" $_o --glob '!.git' \
+    (cd "$1" 2>/dev/null && RIPGREP_CONFIG_PATH= run_bounded "$RG_BIN" $_o --glob '!.git' \
         --field-match-separator "$TAB" -e "$2" -- . 2>/dev/null) | sed 's#^\./##'
 }
 
@@ -653,7 +691,7 @@ grep_names() {
             _o="--files --hidden"
             if [ "$GITIGNORE" != 1 ]; then _o="$_o --no-ignore"; fi
             # shellcheck disable=SC2086
-            (cd "$1" 2>/dev/null && run_bounded "$RG_BIN" $_o --glob '!.git' 2>/dev/null)
+            (cd "$1" 2>/dev/null && RIPGREP_CONFIG_PATH= run_bounded "$RG_BIN" $_o --glob '!.git' 2>/dev/null)
             ;;
         git)
             _o="-lI --no-index"
@@ -952,6 +990,9 @@ case "${1:-serve}" in
         printf 'search  : %s, bounded at %ss\n' "$(grep_engine)" "$GREP_TIMEOUT"
     else
         printf 'search  : %s, UNBOUNDED (no timeout(1) on PATH)\n' "$(grep_engine)"
+    fi
+    if [ -n "$RG_BIN" ] && [ "$RG_OK" != 1 ]; then
+        printf '          WARNING: %s exists but failed the output-format probe\n' "$RG_BIN"
     fi
         printf 'roots   : %s allowed prefixes\n' "$(allowed_roots | wc -l | tr -d ' ')"
         if [ "$GITIGNORE" = 1 ]; then

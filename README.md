@@ -92,7 +92,7 @@ installed on disk. Nothing supervised it and nothing would have noticed.
 | `agent-fsd.service` | `agent-bus-fsd.sh serve`. Separate, so a daemon crash cannot take the agent down. |
 | `agent-update.timer` | Daily (plus 2 min after boot): `claude update`, prune old builds, and restart the agent **only when it is idle**. |
 
-Three things are worth knowing before adapting this:
+Four things are worth knowing before adapting this:
 
 * **`loginctl enable-linger` is mandatory.** Without it a `--user` unit dies at
   logout and never starts at boot.
@@ -105,6 +105,15 @@ Three things are worth knowing before adapting this:
   badly-timed restart costs a repeated turn, not a dropped request. An armed
   `agent-bus-cli.sh wake` is *not* an idle signal; the monitor stays armed while
   the agent works.
+* **`claude --version` reports the symlink, not the running agent.** It answers
+  "what would launch next"; only a restart changes what *is* running. Between
+  ticks the harness's own in-process auto-updater moves that symlink by itself,
+  including *backwards* when upstream rolls a channel pointer off a bad build.
+  Ask the kernel instead:
+  `readlink -f /proc/$(pgrep -u "$(id -u)" -x claude)/exe`. On marvin
+  2026-08-25 the two disagreed by two builds (symlink 2.1.241, process
+  2.1.243) and read as a stalled updater; it had in fact worked correctly the
+  night before.
 
 ```sh
 agent-supervision-install.sh            # linger, enable units, migrate the daemon

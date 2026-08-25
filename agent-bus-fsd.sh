@@ -19,7 +19,7 @@
 
 set -e
 
-FSD_VERSION=1
+FSD_VERSION=2
 
 # A literal tab and newline, for splitting and for rejecting filenames that
 # would corrupt the TSV the listing pass parses.
@@ -50,6 +50,8 @@ Environment:
   AGENT_BUS_FS_MAX_INLINE  Bytes of text sent in a message         (default 262144)
   AGENT_BUS_FS_MAX_BLOB    Bytes a file may be to upload at all    (default 104857600)
   AGENT_BUS_FS_MAX_ENTRIES Directory entries per listing           (default 2000)
+  AGENT_BUS_FS_MAX_HITS    Search matches returned per query       (default 200)
+  AGENT_BUS_FS_GREP_TIMEOUT  Seconds one search may run            (default 15)
   AGENT_BUS_FS_GITIGNORE   Withhold gitignored files and .git       (default 1)
   AGENT_BUS_FS_AGENT       Answer as this agent name     (default: from /whoami)
 
@@ -75,6 +77,11 @@ What is NOT served, unless AGENT_BUS_FS_GITIGNORE=0:
     .gitignore'd files while serving .git would be theatre.
 Tracked file contents are otherwise served raw, with no redaction. Anything
 committed is on the remote already; the gitignored layer is not.
+
+Search (fs.grep) uses ripgrep when a real rg binary is on PATH, otherwise
+`git grep --no-index --exclude-standard`, and plain grep only where there is no
+git at all. All three honour the same exclusions as browsing; the reply names
+which engine ran, and says so when a cap or the timeout cut it short.
 
 Examples:
   agent-bus-fsd.sh check
@@ -112,7 +119,15 @@ require_env() {
     MAX_INLINE="${AGENT_BUS_FS_MAX_INLINE:-262144}"
     MAX_BLOB="${AGENT_BUS_FS_MAX_BLOB:-104857600}"
     MAX_ENTRIES="${AGENT_BUS_FS_MAX_ENTRIES:-2000}"
+    MAX_HITS="${AGENT_BUS_FS_MAX_HITS:-200}"
+    GREP_TIMEOUT="${AGENT_BUS_FS_GREP_TIMEOUT:-15}"
     GITIGNORE="${AGENT_BUS_FS_GITIGNORE:-1}"
+
+    # Resolved once rather than per query: which engine is available is a
+    # property of the box, and `check` should be able to report it.
+    RG_BIN=$(grep_binary rg || true)
+    GIT_BIN=$(grep_binary git || true)
+    TIMEOUT_BIN=$(grep_binary timeout || true)
 
     # Fail closed and loudly at startup rather than quietly serving everything:
     # a control that silently stops applying is worse than one that was never on.
@@ -516,12 +531,245 @@ do_read() {
         publish_rsp
 }
 
+# --- Searching --------------------------------------------------------------
+#
+# Search has to withhold exactly what browsing withholds, which rules out the
+# obvious single recursive pass. Measured on this 7-repo root, a plain
+# `git grep --no-index` returned 8890 of 14042 matched files from .git or an
+# ignored node_modules, because --no-index alone does not consult a nested
+# repository's .gitignore. Adding --exclude-standard takes that to zero and
+# still sweeps the whole root in about a second, so that is the git engine.
+#
+# Every engine normalises to <path> TAB <line> TAB <text>, split on the first
+# two tabs only. Requiring <line> to be digits is what makes that safe: a
+# filename holding a tab yields a non-numeric field and the row is dropped,
+# while tabs inside a source line -- which are everywhere -- survive intact.
+
+# Milliseconds since the epoch. GNU/busybox date has %N; BSD date prints it
+# literally, so a non-numeric result falls back to whole seconds rather than
+# poisoning the arithmetic that reads it.
+now_ms() {
+    _n=$(date +%s%N 2>/dev/null || true)
+    case "$_n" in
+        '' | *[!0-9]*) printf '%s000\n' "$(date +%s)" ;;
+        *) printf '%s\n' $((_n / 1000000)) ;;
+    esac
+}
+
+# grep_binary <name> -- absolute path of a real executable, or nothing.
+#
+# The absolute-path test is the whole point. A box whose interactive shell
+# defines rg as a *function* (Claude Code ships exactly such a shim, and this
+# box has one) satisfies `command -v rg` while having no rg binary anywhere;
+# running it would launch a different program entirely.
+grep_binary() {
+    _b=$(command -v "$1" 2>/dev/null) || return 1
+    case "$_b" in
+        /*)
+            [ -x "$_b" ] || return 1
+            printf '%s\n' "$_b"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+grep_engine() {
+    if [ -n "$RG_BIN" ]; then
+        printf 'rg\n'
+    elif [ -n "$GIT_BIN" ]; then
+        printf 'git\n'
+    else
+        printf 'grep\n'
+    fi
+}
+
+# Bounded so a pathological query can neither pin the box nor outlive the UI's
+# own wait. Detection of the cut is by elapsed time rather than exit status:
+# these all run at the head of a pipeline, where $? belongs to the tail.
+run_bounded() {
+    if [ -n "$TIMEOUT_BIN" ]; then
+        "$TIMEOUT_BIN" "$GREP_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Case handling is smart-case throughout: an all-lowercase query is
+# case-insensitive, one with a capital in it is not. rg has the flag; the other
+# two get the same rule applied by hand so search behaves identically whichever
+# engine a peer's box happens to have.
+grep_icase_flag() {
+    case "$1" in
+        *[A-Z]*) printf '' ;;
+        *) printf -- '-i' ;;
+    esac
+}
+
+# Each runner cds into the search directory and searches "." so the engine
+# emits relative paths. Stripping a literal "./" prefix is safe; stripping an
+# absolute prefix with sed would not be, since a directory name may hold
+# characters sed reads as syntax.
+
+grep_run_rg() {
+    _o="--no-heading --line-number --with-filename --color never -I --hidden --smart-case"
+    if [ "$3" != true ]; then _o="$_o --fixed-strings"; fi
+    if [ "$GITIGNORE" != 1 ]; then _o="$_o --no-ignore"; fi
+    # shellcheck disable=SC2086
+    (cd "$1" 2>/dev/null && run_bounded "$RG_BIN" $_o --glob '!.git' \
+        --field-match-separator "$TAB" -e "$2" -- . 2>/dev/null) | sed 's#^\./##'
+}
+
+grep_run_git() {
+    _o="-zn -I --no-index"
+    if [ "$GITIGNORE" = 1 ]; then _o="$_o --exclude-standard"; fi
+    if [ "$3" != true ]; then _o="$_o --fixed-strings"; fi
+    _o="$_o $(grep_icase_flag "$2")"
+    # shellcheck disable=SC2086
+    (cd "$1" 2>/dev/null && run_bounded "$GIT_BIN" grep $_o -e "$2" -- . 2>/dev/null) |
+        tr '\000' '\011' | sed 's#^\./##'
+}
+
+# Only reachable with GITIGNORE=0, since the daemon refuses to start without git
+# while the flag is on -- so this engine deliberately has no ignore handling.
+grep_run_grep() {
+    _o="-rnI --binary-files=without-match --exclude-dir=.git"
+    if [ "$3" != true ]; then _o="$_o -F"; fi
+    _o="$_o $(grep_icase_flag "$2")"
+    # shellcheck disable=SC2086
+    (cd "$1" 2>/dev/null && run_bounded grep $_o -e "$2" -- . 2>/dev/null) |
+        sed 's#^\./##' | sed "s#:#$TAB#; s#:#$TAB#"
+}
+
+# grep_names <dir> <query> -- served paths whose name contains the query.
+#
+# Worth its own pass because the thing you are looking for is often a file, not
+# a line: "fsd" finds agent-bus-fsd.sh, which no content search would surface.
+# The empty pattern is how the git engine enumerates what it would serve --
+# same exclusions as the content search, by construction rather than by a
+# second list of rules that could drift out of step.
+grep_names() {
+    case "$(grep_engine)" in
+        rg)
+            _o="--files --hidden"
+            if [ "$GITIGNORE" != 1 ]; then _o="$_o --no-ignore"; fi
+            # shellcheck disable=SC2086
+            (cd "$1" 2>/dev/null && run_bounded "$RG_BIN" $_o --glob '!.git' 2>/dev/null)
+            ;;
+        git)
+            _o="-lI --no-index"
+            if [ "$GITIGNORE" = 1 ]; then _o="$_o --exclude-standard"; fi
+            # shellcheck disable=SC2086
+            (cd "$1" 2>/dev/null && run_bounded "$GIT_BIN" grep $_o -e '' -- . 2>/dev/null)
+            ;;
+        *)
+            (cd "$1" 2>/dev/null && run_bounded find . -type f -not -path '*/.git/*' 2>/dev/null)
+            ;;
+    esac | sed 's#^\./##' | grep -i -F -e "$2" 2>/dev/null | head -n 50
+}
+
+# do_grep <rid> <logical> <resolved> <query> <regex?>
+do_grep() {
+    _rid="$1"
+    _logical="$2"
+    _dir="$3"
+    _q="$4"
+    _rx="$5"
+    if [ -z "$_q" ]; then
+        reply_error "$_rid" "empty search"
+        return
+    fi
+    # Searching "from" a file means searching the directory holding it, which is
+    # what the UI asks for when you search with a file already open.
+    if [ ! -d "$_dir" ]; then
+        _dir=$(dirname -- "$_dir")
+        case "$_logical" in
+            */*) _logical="${_logical%/*}" ;;
+            *) _logical="" ;;
+        esac
+    fi
+
+    _engine=$(grep_engine)
+    _hitfile=$(mktemp "${TMPDIR:-/tmp}/agent-bus-fsd.XXXXXX") || {
+        reply_error "$_rid" "mktemp failed"
+        return
+    }
+    _namefile=$(mktemp "${TMPDIR:-/tmp}/agent-bus-fsd.XXXXXX") || {
+        rm -f "$_hitfile"
+        reply_error "$_rid" "mktemp failed"
+        return
+    }
+
+    _t0=$(now_ms)
+    # A hard line cap ahead of jq bounds memory on a query like "e"; the real
+    # per-file and overall caps are applied after grouping, so what comes back
+    # is the alphabetical first N rather than an arbitrary N.
+    _scan=$((MAX_HITS * 20))
+    case "$_engine" in
+        rg) grep_run_rg "$_dir" "$_q" "$_rx" ;;
+        git) grep_run_git "$_dir" "$_q" "$_rx" ;;
+        *) grep_run_grep "$_dir" "$_q" "$_rx" ;;
+    esac | head -n "$_scan" >"$_hitfile" 2>/dev/null || true
+    grep_names "$_dir" "$_q" >"$_namefile" 2>/dev/null || true
+    _t1=$(now_ms)
+    _elapsed=$((_t1 - _t0))
+    # timeout(1) fires at the head of a pipeline, where its status is lost, so
+    # the wall clock is what tells us the sweep was cut short. The margin
+    # absorbs now_ms falling back to whole seconds on a box without GNU date.
+    if [ -n "$TIMEOUT_BIN" ] && [ "$_elapsed" -ge "$((GREP_TIMEOUT * 1000 - 500))" ]; then
+        _timedout=true
+    else
+        _timedout=false
+    fi
+
+    jq -R -s --rawfile names "$_namefile" \
+        --arg rid "$_rid" --arg agent "$ME" --arg path "$_logical" \
+        --arg q "$_q" --arg engine "$_engine" \
+        --argjson max "$MAX_HITS" --argjson timedout "$_timedout" \
+        --argjson elapsed "$_elapsed" '
+        def clip: if length > 400 then .[0:400] + " …" else . end;
+        (split("\n") | map(select(length > 0))
+         | map(
+             (index("\t")) as $i
+             | select($i != null)
+             | {p: .[0:$i], r: .[$i+1:]}
+             | (.r | index("\t")) as $j
+             | select($j != null)
+             | {path: .p, line: .r[0:$j], text: .r[$j+1:]}
+             | select(.line | test("^[0-9]+$"))
+             | {path: .path, line: (.line | tonumber), text: (.text | clip)})
+        ) as $all
+        # 20 per file so one generated file cannot crowd out every other hit.
+        | ($all | group_by(.path) | map(.[0:20]) | flatten) as $capped
+        | ($capped[0:$max]) as $hits
+        | (($capped | length) > $max) as $overcap
+        | (($all | length) > ($capped | length)) as $overfile
+        | ($names | split("\n") | map(select(length > 0))) as $files
+        | {body: ("search " + $q + ": " + ($hits | length | tostring) + " matches in "
+                  + ($hits | map(.path) | unique | length | tostring) + " files"),
+           meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
+                  op: "grep", path: $path, query: $q, engine: $engine,
+                  matches: $hits, files: $files, elapsed: $elapsed,
+                  trunc: ($overcap or $overfile or $timedout),
+                  truncwhy: (if $timedout then "timed out"
+                             elif $overcap then "capped at " + ($max | tostring) + " matches"
+                             elif $overfile then "capped at 20 matches per file"
+                             else "" end)}}' <"$_hitfile" |
+        publish_rsp
+    rm -f "$_hitfile" "$_namefile"
+}
+
+# The ops list is how the UI knows whether to offer search: a fleet updates one
+# box at a time, and a search box that silently times out against last week's
+# daemon is worse than one that says why it is disabled. Version alone would do
+# it, but naming the ops means the next capability needs no new field.
 do_ping() {
     jq -n --arg rid "$1" --arg agent "$ME" --arg root "$ROOT" \
+        --arg engine "$(grep_engine)" \
         --argjson version "$FSD_VERSION" '
         {body: ($agent + " serving " + $root),
          meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
-                op: "ping", root: $root, version: $version}}' |
+                op: "ping", root: $root, version: $version,
+                ops: ["list", "read", "ping", "grep"], engine: $engine}}' |
         publish_rsp
 }
 
@@ -532,7 +780,7 @@ handle_request() {
     _msg="$1"
     _kind=$(printf '%s' "$_msg" | jq -r '.meta.kind // empty' 2>/dev/null || true)
     case "$_kind" in
-        fs.list | fs.read | fs.ping) ;;
+        fs.list | fs.read | fs.ping | fs.grep) ;;
         *) return 0 ;;
     esac
     # Case-insensitive: agents.json capitalises names, humans rarely do.
@@ -544,7 +792,14 @@ handle_request() {
     [ -n "$_rid" ] || return 0
     _path=$(printf '%s' "$_msg" | jq -r '.meta.path // ""')
 
-    log "$_kind ${_path:-.} (rid $_rid)"
+    _query=$(printf '%s' "$_msg" | jq -r '.meta.query // ""')
+    _regex=$(printf '%s' "$_msg" | jq -r 'if .meta.regex == true then "true" else "false" end')
+
+    if [ "$_kind" = "fs.grep" ]; then
+        log "$_kind ${_path:-.} q=$_query (rid $_rid)"
+    else
+        log "$_kind ${_path:-.} (rid $_rid)"
+    fi
 
     if [ "$_kind" = "fs.ping" ]; then
         do_ping "$_rid"
@@ -567,6 +822,7 @@ handle_request() {
     case "$_kind" in
         fs.list) do_list "$_rid" "$_path" "$_real" ;;
         fs.read) do_read "$_rid" "$_path" "$_real" ;;
+        fs.grep) do_grep "$_rid" "$_path" "$_real" "$_query" "$_regex" ;;
     esac
 }
 
@@ -692,6 +948,11 @@ case "${1:-serve}" in
         printf 'bus     : %s\n' "$AGENT_BUS_URL"
         printf 'topics  : %s -> %s\n' "$REQ_TOPIC" "$RSP_TOPIC"
         printf 'lister  : %s\n' "$LISTER"
+    if [ -n "$TIMEOUT_BIN" ]; then
+        printf 'search  : %s, bounded at %ss\n' "$(grep_engine)" "$GREP_TIMEOUT"
+    else
+        printf 'search  : %s, UNBOUNDED (no timeout(1) on PATH)\n' "$(grep_engine)"
+    fi
         printf 'roots   : %s allowed prefixes\n' "$(allowed_roots | wc -l | tr -d ' ')"
         if [ "$GITIGNORE" = 1 ]; then
             printf 'excluded: gitignored files and .git\n'

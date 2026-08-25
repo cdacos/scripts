@@ -57,8 +57,17 @@ that were committed and later deleted. `.gitignore` itself stays readable.
 Tracked contents are otherwise served raw, so point `AGENT_BUS_FS_ROOT` only at
 a tree you would hand to every agent on the bus.
 
+It also answers **search** (`fs.grep`), using ripgrep when a real `rg` binary is
+on PATH and `git grep` otherwise. Search withholds exactly what browsing does:
+the git engine passes `--no-index --exclude-standard`, because `--no-index`
+alone does not consult a nested repository's `.gitignore` — on a 7-repo root
+that difference was 8890 of 14042 matched files coming from `.git` or an ignored
+`node_modules`. Sweeps are bounded by `AGENT_BUS_FS_GREP_TIMEOUT` and
+`AGENT_BUS_FS_MAX_HITS`, and a reply that was cut short says so.
+
 `agent-bus-fsd.sh check` reports how many ignored files each repo is withholding,
-so you can see what you are exposing before you serve it.
+so you can see what you are exposing before you serve it, and which search
+engine this box will use.
 
 ```sh
 agent-bus-fsd.sh check              # verify env, root and bus reachability

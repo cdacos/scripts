@@ -313,12 +313,44 @@ content_since() {
     date -u -d "@$_mt" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown'
 }
 
-# The guidance commit this box is actually on. Local ref only: no fetch, no
-# network. This runs at session start and must not stall it.
+# The guidance commit this box's chezmoi SOURCE CLONE is on. Local ref only: no
+# fetch, no network -- this runs at session start and must not stall it.
+#
+# Read it COMPARATIVELY or not at all. Speedy-20 proved why on 2026-08-27: its
+# clone HEAD and its remote-tracking origin/main both read 5c44985, so the box
+# looked current to itself, while the real origin/main was 5272ae2 -- one commit
+# ahead, and that commit was precisely the guidance its CLAUDE.md was missing. A
+# stale remote-tracking ref cannot report its own staleness. So the highest value
+# across the fleet is "current"; a single box's value can never self-certify, and
+# a reader who treats it as "this box is up to date" gets the exact false-healthy
+# this whole mechanism exists to kill. `fetched=` below is how much to trust it.
 guidance_head() {
     command -v git >/dev/null 2>&1 || { printf 'nogit'; return 0; }
     [ -d "$AGENT_GUIDANCE_SOURCE/.git" ] || { printf 'none'; return 0; }
     git -C "$AGENT_GUIDANCE_SOURCE" rev-parse --short HEAD 2>/dev/null || printf 'unknown'
+}
+
+# When this box last refreshed its view of the remote. `guidance=` is a comparison
+# against a ref that was fetched at SOME point, and that point is the entire
+# question -- a week-old ref makes "not behind" meaningless. Does not fetch.
+guidance_fetched() {
+    _fh="$AGENT_GUIDANCE_SOURCE/.git/FETCH_HEAD"
+    [ -r "$_fh" ] || { printf 'never'; return 0; }
+    _mt=$(stat -c %Y "$_fh" 2>/dev/null || echo '')
+    [ -n "$_mt" ] || { printf 'unknown'; return 0; }
+    date -u -d "@$_mt" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown'
+}
+
+# The guidance ACTUALLY IN FORCE, as opposed to the channel that delivers it.
+# Speedy-20's second finding: checker= and guidance= do not share provenance --
+# the checker arrives as a raw externals fetch that self-heals hourly, while
+# guidance is a git clone needing a pull that may never happen. Neither vouches
+# for the other, and reporting both as one "version" invites reading a fresh
+# checker as evidence of fresh guidance. Nor does a current clone HEAD prove
+# anything was applied FROM it. So hash the artefact itself: identical hashes
+# across two boxes mean identical guidance in force, whatever the channels did.
+applied_guidance() {
+    fingerprint "$HOME/.claude/CLAUDE.md"
 }
 
 # Post when the reported content changes, or when the last post has aged out.
@@ -348,8 +380,12 @@ emit_heartbeat() {
     _checker=$(fingerprint "$AGENT_CHECKER_PATH")
     _cli=$(fingerprint "$0")
     _guidance=$(guidance_head)
+    _applied=$(applied_guidance)
+    _fetched=$(guidance_fetched)
     _since=$(content_since "$AGENT_CHECKER_PATH")
-    _stamp="$_checker/$_cli/$_guidance"
+    # _fetched is deliberately NOT in the stamp: it moves on every fetch and would
+    # make the rate limit meaningless. The three that describe content are.
+    _stamp="$_checker/$_cli/$_guidance/$_applied"
     [ "$_force" = 1 ] || heartbeat_due "$_stamp" || { HEARTBEAT_POSTED=rate-limited; return 0; }
 
     require_env
@@ -360,11 +396,11 @@ emit_heartbeat() {
     # One extra GET at session start, and it degrades to the raw key if it fails.
     _sess=$(api GET /whoami 2>/dev/null | jq -r '.session // empty' 2>/dev/null) || _sess=''
     [ -n "$_sess" ] || _sess="${SESSION_KEY:-unknown}"
-    _body=$(printf 'heartbeat %s host=%s checker=%s cli=%s guidance=%s since=%s' \
-        "$_sess" "$_host" "$_checker" "$_cli" "$_guidance" "$_since")
+    _body=$(printf 'heartbeat %s host=%s checker=%s cli=%s guidance=%s applied=%s fetched=%s since=%s' \
+        "$_sess" "$_host" "$_checker" "$_cli" "$_guidance" "$_applied" "$_fetched" "$_since")
     _meta=$(jq -n --arg s "$_sess" --arg h "$_host" --arg c "$_checker" \
-        --arg l "$_cli" --arg g "$_guidance" --arg t "$_since" \
-        '{kind:"heartbeat",session:$s,host:$h,checker:$c,cli:$l,guidance:$g,since:$t}')
+        --arg l "$_cli" --arg g "$_guidance" --arg a "$_applied" --arg f "$_fetched" --arg t "$_since" \
+        '{kind:"heartbeat",session:$s,host:$h,checker:$c,cli:$l,guidance:$g,applied:$a,fetched:$f,since:$t}')
     if api POST "/topics/$AGENT_HEARTBEAT_TOPIC" -d "$(payload "$_body" "$_meta")" >/dev/null 2>&1; then
         HEARTBEAT_POSTED=yes
         mkdir -p "$(dirname "$HEARTBEAT_STATE")" 2>/dev/null || true
@@ -469,9 +505,10 @@ case "$cmd" in
         require_env
         require_jq
         emit_heartbeat "${1:-}"
-        printf 'heartbeat %s: checker=%s guidance=%s -> %s\n' \
+        printf 'heartbeat %s: checker=%s guidance=%s applied=%s fetched=%s -> %s\n' \
             "$HEARTBEAT_POSTED" "$(fingerprint "$AGENT_CHECKER_PATH")" \
-            "$(guidance_head)" "$AGENT_HEARTBEAT_TOPIC"
+            "$(guidance_head)" "$(applied_guidance)" "$(guidance_fetched)" \
+            "$AGENT_HEARTBEAT_TOPIC"
         ;;
     send)
         require_env

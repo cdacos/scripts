@@ -20,7 +20,45 @@ Environment=TERM=xterm-256color
 # keeps `tmux -L agent attach` working for a human; the client holds that pty, so
 # when claude exits the session ends, the client exits, script exits, systemd
 # restarts.
-ExecStart=/usr/bin/script -qfec "/usr/bin/tmux -L agent new-session -A -s agent %h/.local/bin/agent-run.sh" /dev/null
+#
+# THE DBUS_SESSION_BUS_ADDRESS=/nonexistent/bus IS NOT A TYPO. tmux 3.4 links
+# libsystemd and calls StartTransientUnit over sd_bus_default_user, so every pane
+# it spawns is moved into a fresh tmux-spawn-<uuid>.scope -- a SIBLING of this
+# service under app.slice, not a child. The tmux server stays in the unit; claude
+# does not. Consequences, all measured:
+#   - `Tasks:` and MemoryCurrent describe script+tmux, not the agent (2.5MB/3 tasks
+#     against the agent's real 719MB/16). A future MemoryMax=/TasksMax=/CPUQuota=
+#     here would silently fail to constrain claude.
+#   - KillMode=control-group cannot reach claude. Teardown works only because
+#     ExecStop kills the tmux server, closing the pane pty so the kernel hangs up
+#     the foreground process group -- i.e. it depends on claude's SIGHUP handler
+#     plus an in-process orphan poll, neither of which systemd owns. A pane process
+#     that ignores SIGHUP survives `systemctl restart` outright (verified with a
+#     mimic unit). Worse, any cgroup-level kill that skips ExecStop strands claude
+#     alive in the escaped scope; agent-run.sh's one-per-VM guard then refuses all
+#     StartLimitBurst starts and the unit parks in `failed`.
+#   - agent-supervision-install.sh status therefore reports supervised=no, and is
+#     RIGHT to. Do not "fix" that by loosening its /proc/PID/cgroup grep.
+#
+# Denying the tmux SERVER the user bus means StartTransientUnit cannot be called
+# and the pane is simply forked inside this unit's cgroup. The session gets the
+# real bus address back via `new-session -e`, so nothing the agent spawns loses
+# it. claude itself has zero DBUS_SESSION_BUS_ADDRESS references, so this costs it
+# nothing either way.
+#
+# Verified with mimic units before adoption: the pane lands in the service cgroup
+# instead of a tmux-spawn scope; a SIGHUP-IGNORING payload is now killed by
+# `systemctl restart` where it previously survived orphaned; `tmux -L agent attach`
+# still works, which is why this beats dropping tmux. It ran as a local drop-in on
+# marvin from 2026-08-22 and was promoted here on 2026-08-27 once that box had
+# survived a real restart on it (08:15:33 UTC), with /proc/<claude>/cgroup
+# confirmed inside agent-claude.service. Tweety-8 independently reported the
+# unfixed escape on its own box, which is what prompted the promotion.
+#
+# script(1) is retained deliberately: claude's 30s orphan-check backstop arms only
+# when process.stdin.isTTY. Removing script would disarm it silently while making
+# the status line finally read supervised=yes. Drop tmux, never script.
+ExecStart=/usr/bin/script -qfec "env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/bus /usr/bin/tmux -L agent new-session -A -s agent -e DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus %h/.local/bin/agent-run.sh" /dev/null
 ExecStop=/usr/bin/tmux -L agent kill-server
 Restart=always
 RestartSec=5s

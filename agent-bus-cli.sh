@@ -349,6 +349,13 @@ guidance_fetched() {
 # checker as evidence of fresh guidance. Nor does a current clone HEAD prove
 # anything was applied FROM it. So hash the artefact itself: identical hashes
 # across two boxes mean identical guidance in force, whatever the channels did.
+#
+# CAVEAT, and it limits what a reader may conclude (Speedy-20, 2026-08-27): this
+# hashes ~/.claude/CLAUDE.md alone, and that file's first line is `@persona.md` --
+# an import chezmoi delivers as a separate per-agent file that DIFFERS on every box
+# by design. Identical applied= therefore means identical TOP-LEVEL guidance, never
+# "these two boxes are configured the same". Hashing the import too would make
+# every box differ and destroy the comparison, so this is a caveat, not a defect.
 applied_guidance() {
     fingerprint "$HOME/.claude/CLAUDE.md"
 }

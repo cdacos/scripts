@@ -30,6 +30,9 @@
 #   AGENT_IDLE_SAMPLE_SECS  length of the live activity sample  (default 30)
 #   AGENT_KEEP_VERSIONS     harness builds to retain            (default 3)
 #   AGENT_FETCH_MIN_SECS    min gap between `claude update` runs (default 20h)
+#   AGENT_GUIDANCE_SOURCE   chezmoi source to check   (default ~/.local/share/chezmoi)
+#   AGENT_GUIDANCE_FETCH    1 = fetch before comparing, 0 = local refs only (default 1)
+#   AGENT_GUIDANCE_TIMEOUT  seconds allowed for that fetch      (default 20)
 #   AGENT_DEFER_WARN_HOURS  warn if drift persists this long    (default 24)
 #   AGENT_DEFER_MAX_HOURS   restart anyway past this            (default 48)
 #   AGENT_IDLE_QUIET_SECS   deprecated alias for _SETTLE_SECS
@@ -45,6 +48,9 @@ AGENT_IDLE_SETTLE_SECS="${AGENT_IDLE_SETTLE_SECS:-${AGENT_IDLE_QUIET_SECS:-120}}
 AGENT_IDLE_SAMPLE_SECS="${AGENT_IDLE_SAMPLE_SECS:-30}"
 AGENT_KEEP_VERSIONS="${AGENT_KEEP_VERSIONS:-3}"
 AGENT_FETCH_MIN_SECS="${AGENT_FETCH_MIN_SECS:-72000}"
+AGENT_GUIDANCE_SOURCE="${AGENT_GUIDANCE_SOURCE:-$HOME/.local/share/chezmoi}"
+AGENT_GUIDANCE_FETCH="${AGENT_GUIDANCE_FETCH:-1}"
+AGENT_GUIDANCE_TIMEOUT="${AGENT_GUIDANCE_TIMEOUT:-20}"
 AGENT_DEFER_WARN_HOURS="${AGENT_DEFER_WARN_HOURS:-24}"
 AGENT_DEFER_MAX_HOURS="${AGENT_DEFER_MAX_HOURS:-48}"
 
@@ -222,6 +228,94 @@ fetch_due() {
     [ $(( _now - _last )) -ge "$AGENT_FETCH_MIN_SECS" ]
 }
 
+# --- guidance drift --------------------------------------------------------
+# The harness check above asks the kernel which build is RUNNING. Nothing asked
+# the equivalent question about GUIDANCE -- the CLAUDE.md rules and skills that
+# reach a box as tracked files in the chezmoi source. A rule is in force only on
+# boxes that pulled it, and until this existed no box could answer "is my
+# guidance current?" without someone running git by hand.
+#
+# It is not the same shape as the harness check, and the asymmetry is the reason:
+#   cdacos/scripts   is PUBLIC  -- the externals re-fetch over anonymous HTTPS,
+#                                  which is why `chezmoi apply` alone updates them
+#   cdacos/dotfiles  is PRIVATE -- tracked files need credentials, so only
+#                                  `chezmoi update` (git pull) brings them in
+# Verified 2026-08-27: raw.githubusercontent.com returns 200 for the first and
+# 404 anonymous for the second.
+#
+# REPORT ONLY. It never pulls. `chezmoi update` runs `git pull --autostash
+# --rebase` against the source, and doing that unattended on an hourly timer
+# could rebase over someone's local edits. Detect and say so; never act.
+#
+# WHY THE FETCH IS NOT OPTIONAL, and this is the whole design. Comparing HEAD to
+# the CACHED origin/main is nearly free and needs no credentials -- but on a box
+# whose cached ref is itself stale it does not fail silent, it fails CONFIDENT.
+# Measured on tweety 2026-08-27: HEAD ef27efa, cached origin/main 61ddf06,
+# `rev-list HEAD...origin/main` = "1 behind" -- while the commit actually being
+# waited on (5c44985) was not an object in that repo at all (`git cat-file -t` ->
+# not a valid object name). A precise wrong number is worse than no number; it is
+# the same defect as the idle gate that used to name a cause it never measured.
+# So when the fetch does not happen, the count is reported WITH the age of the
+# ref it was computed against, and the number carries its own expiry date.
+# (Design and the measurement behind it: Tweety-8.)
+guidance_drift() {
+    _src=$AGENT_GUIDANCE_SOURCE
+    # Absent entirely is the ordinary case -- plenty of boxes have no chezmoi --
+    # so that stays silent. Present but not a repo is NOT ordinary and must say
+    # so: during development this branch swallowed a wrong AGENT_GUIDANCE_SOURCE
+    # three test runs in a row, which is precisely the silent-negative this file
+    # spends the rest of its length arguing against.
+    [ -e "$_src" ] || return 0
+    if [ ! -d "$_src/.git" ]; then
+        log "guidance: $_src exists but is not a git repository -- cannot check"
+        return 0
+    fi
+
+    _fresh=no
+    if [ "$AGENT_GUIDANCE_FETCH" = 1 ]; then
+        # Through in_agent_env for the same reason `claude update` is: the timer's
+        # own environment has neither PATH nor the SSH agent. Bounded, because a
+        # fetch that hangs inside the hourly tick is a worse bug than the drift it
+        # is looking for.
+        if in_agent_env timeout "$AGENT_GUIDANCE_TIMEOUT" \
+               git -C "$_src" fetch --quiet origin 2>/dev/null; then
+            _fresh=yes
+        else
+            log "guidance: fetch failed or timed out after ${AGENT_GUIDANCE_TIMEOUT}s"
+        fi
+    fi
+
+    _head=$(git -C "$_src" rev-parse --short HEAD 2>/dev/null || true)
+    _remote=$(git -C "$_src" rev-parse --short origin/main 2>/dev/null || true)
+    if [ -z "$_head" ] || [ -z "$_remote" ]; then
+        log "guidance: cannot resolve HEAD or origin/main in $_src -- refusing to guess"
+        return 0
+    fi
+
+    _behind=$(git -C "$_src" rev-list --count HEAD..origin/main 2>/dev/null || true)
+    case "$_behind" in '' | *[!0-9]*) log "guidance: cannot count revisions -- refusing to guess"; return 0 ;; esac
+
+    if [ "$_behind" -eq 0 ]; then
+        [ "$_fresh" = yes ] && log "guidance: current ($_head)"
+        return 0
+    fi
+
+    # Never report a bare count against a ref we did not just refresh.
+    if [ "$_fresh" = yes ]; then
+        log "guidance: $_behind commit(s) behind -- HEAD $_head, origin/main $_remote. Run: chezmoi update"
+    else
+        _witness="ref age unknown"
+        if [ -f "$_src/.git/FETCH_HEAD" ]; then
+            _mt=$(date -r "$_src/.git/FETCH_HEAD" +%s 2>/dev/null || echo '')
+            case "$_mt" in
+                '' | *[!0-9]*) ;;
+                *) _witness="last fetched $(( ( $(date +%s) - _mt ) / 3600 ))h ago" ;;
+            esac
+        fi
+        log "guidance: at least $_behind commit(s) behind -- HEAD $_head vs CACHED origin/main $_remote ($_witness). The real gap may be larger; this count is against a ref that was not refreshed. Run: chezmoi update"
+    fi
+}
+
 # --- pruning ---------------------------------------------------------------
 # Keep the newest AGENT_KEEP_VERSIONS builds, and never drop the one in use or
 # the one the symlink points at, whatever their age.
@@ -281,6 +375,10 @@ main() {
 
     # Only meaningful on a native install; a no-op where there is no versions/ dir.
     prune_versions "$running" "$installed"
+
+    # Independent of harness drift, and deliberately before the up-to-date return
+    # below: a box can be on the current build and still be running week-old rules.
+    guidance_drift
 
     if [ "$running_path" = "$installed_path" ]; then
         log "up to date ($running); no restart"

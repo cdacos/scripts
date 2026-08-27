@@ -403,11 +403,18 @@ emit_heartbeat() {
     # One extra GET at session start, and it degrades to the raw key if it fails.
     _sess=$(api GET /whoami 2>/dev/null | jq -r '.session // empty' 2>/dev/null) || _sess=''
     [ -n "$_sess" ] || _sess="${SESSION_KEY:-unknown}"
-    _body=$(printf 'heartbeat %s host=%s checker=%s cli=%s guidance=%s applied=%s fetched=%s since=%s' \
+    # Each hash says WHICH hash it is. Speedy-21 read the unlabelled 12-hex values
+    # as git blob shas -- a reasonable reading next to a git commit in the same
+    # line -- checked `git hash-object`, got different numbers, and concluded main
+    # had moved. Both are legitimate ids for the same bytes; only the label
+    # separates them. The meta keeps values RAW so machine readers need not strip
+    # a prefix, and names the algorithm once in hash_alg.
+    _body=$(printf 'heartbeat %s host=%s checker=sha256:%s cli=sha256:%s guidance=git:%s applied=sha256:%s fetched=%s since=%s' \
         "$_sess" "$_host" "$_checker" "$_cli" "$_guidance" "$_applied" "$_fetched" "$_since")
     _meta=$(jq -n --arg s "$_sess" --arg h "$_host" --arg c "$_checker" \
         --arg l "$_cli" --arg g "$_guidance" --arg a "$_applied" --arg f "$_fetched" --arg t "$_since" \
-        '{kind:"heartbeat",session:$s,host:$h,checker:$c,cli:$l,guidance:$g,applied:$a,fetched:$f,since:$t}')
+        '{kind:"heartbeat",session:$s,host:$h,checker:$c,cli:$l,guidance:$g,applied:$a,fetched:$f,since:$t,
+          hash_alg:"sha256, first 12 hex; guidance is a git commit"}')
     if api POST "/topics/$AGENT_HEARTBEAT_TOPIC" -d "$(payload "$_body" "$_meta")" >/dev/null 2>&1; then
         HEARTBEAT_POSTED=yes
         mkdir -p "$(dirname "$HEARTBEAT_STATE")" 2>/dev/null || true
@@ -512,7 +519,7 @@ case "$cmd" in
         require_env
         require_jq
         emit_heartbeat "${1:-}"
-        printf 'heartbeat %s: checker=%s guidance=%s applied=%s fetched=%s -> %s\n' \
+        printf 'heartbeat %s: checker=sha256:%s guidance=git:%s applied=sha256:%s fetched=%s -> %s\n' \
             "$HEARTBEAT_POSTED" "$(fingerprint "$AGENT_CHECKER_PATH")" \
             "$(guidance_head)" "$(applied_guidance)" "$(guidance_fetched)" \
             "$AGENT_HEARTBEAT_TOPIC"

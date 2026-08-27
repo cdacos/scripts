@@ -20,7 +20,6 @@ Both tools are preinstalled in the dev container (`dev-container.sh`'s embedded 
 ## Conventions
 
 - `dev-container.sh` and `check-tools.sh` are POSIX sh (`#!/bin/sh`) — avoid bashisms (arrays, `[[ ]]`, `local` is used sparingly). Scripts in `jellyfin-media-player/` are bash.
-- Commit messages are suffixed with `[scripts]` (e.g. `Fix dev-container mounts [scripts]`).
 
 ## Architecture: dev-container.sh (`dev!`)
 

@@ -99,21 +99,30 @@ installed on disk. Nothing supervised it and nothing would have noticed.
 | `agent.target` | Groups the two, and is what `default.target` wants at boot. |
 | `agent-claude.service` | The agent. `script(1)` supplies the pty its TUI needs; `tmux -L agent` nests inside so a human can still `tmux -L agent attach`. |
 | `agent-fsd.service` | `agent-bus-fsd.sh serve`. Separate, so a daemon crash cannot take the agent down. |
-| `agent-update.timer` | Daily (plus 2 min after boot): `claude update`, prune old builds, and restart the agent **only when it is idle**. |
+| `agent-update.timer` | Hourly (plus 2 min after boot): check for drift, prune old builds, and restart the agent onto the installed build when it is idle. `claude update` itself runs on its own ~daily stamp, not every tick. |
 
-Four things are worth knowing before adapting this:
+Five things are worth knowing before adapting this:
 
 * **`loginctl enable-linger` is mandatory.** Without it a `--user` unit dies at
   logout and never starts at boot.
 * **Neither `EnvironmentFile` nor `bash -lc` restores the agent's environment**,
   and both fail silently — see the header of `agent-env.sh`, which is the one
   place that solves it.
-* **The idle gate is deliberately approximate**: no un-acked bus mail, no
-  transcript written for 10 minutes, and near-zero CPU. It is allowed to be
-  imperfect because the bus's `ack` means *handled*, not *delivered* — a
-  badly-timed restart costs a repeated turn, not a dropped request. An armed
-  `agent-bus-cli.sh wake` is *not* an idle signal; the monitor stays armed while
-  the agent works.
+* **The agent resumes rather than restarting cold.** `agent-run.sh` passes
+  `--continue`, so a restart costs a repeated turn and one dead in-flight tool
+  call — not the agent's context. This is what lets the idle gate be cheap: an
+  accurate gate is only worth building if interrupting is expensive.
+* **The idle gate is deliberately approximate, and deliberately small**: no
+  un-acked bus mail, no transcript write for 120s, and no transcript *growth*
+  during a 30s sample. Growth, not mtime — an idle session's `.jsonl` gets
+  zero-content bookkeeping touches that move mtime with the byte count
+  unchanged, and reading those as "busy" is what stranded marvin on a stale
+  harness for three days. There was also a CPU arm; it was deleted after
+  measurement showed its idle floor (76–98 ticks/30s) sat four times above its
+  own threshold (20), so it could never once return "idle" — and that the long
+  tool call it existed to catch burns CPU in the compiler, not in `claude`.
+  An armed `agent-bus-cli.sh wake` is *not* an idle signal either; the monitor
+  stays armed while the agent works.
 * **`claude --version` reports the symlink, not the running agent.** It answers
   "what would launch next"; only a restart changes what *is* running. Between
   ticks the harness's own in-process auto-updater moves that symlink by itself,
@@ -131,9 +140,11 @@ agent-supervision-install.sh cutover    # hand a hand-started tmux agent to syst
 ```
 
 Per-box overrides go in `~/.config/agent/run.conf` (`AGENT_NAME`,
-`AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_START_PROMPT`, `AGENT_UPDATE_MODE`,
-`AGENT_IDLE_QUIET_SECS`, `AGENT_KEEP_VERSIONS`). Set `AGENT_UPDATE_MODE=notify`
-on a box that should report drift and never act on it.
+`AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_START_PROMPT`, `AGENT_RESUME`,
+`AGENT_UPDATE_MODE`, `AGENT_IDLE_SETTLE_SECS`, `AGENT_FETCH_MIN_SECS`,
+`AGENT_KEEP_VERSIONS`). Set `AGENT_UPDATE_MODE=notify` on a box that should
+report drift and never act on it, or `AGENT_RESUME=0` on one whose agent should
+always start from a clean context.
 
 ## Install
 

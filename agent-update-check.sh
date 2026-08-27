@@ -12,12 +12,24 @@
 # AGENT_DEFER_MAX_HOURS, whether it looks idle or not. The ceiling exists because
 # the gate's proxies can be wrong in the direction of "busy" indefinitely.
 #
+# The gate is deliberately cheap rather than clever, because agent-run.sh now
+# resumes the previous conversation (`--continue`). A badly-timed restart costs
+# a repeated turn and one dead in-flight tool call, not the agent's context.
+# Once interrupting is cheap, accuracy stops being worth paying for -- so this
+# uses one honest signal (does the transcript actually grow?) and retries often,
+# instead of stacking proxies that are each wrong in a different direction.
+#
+# The timer ticks HOURLY. Losing the idle coin toss used to cost 24 hours, which
+# is how a single false "busy" stranded this box on a stale harness for days.
+# The network fetch stays on its own ~daily stamp (AGENT_FETCH_MIN_SECS) so the
+# faster tick does not mean the fleet hammers upstream.
+#
 # Per-box overrides in ~/.config/agent/run.conf:
 #   AGENT_UPDATE_MODE       auto | notify   (notify = report drift, never act)
 #   AGENT_IDLE_SETTLE_SECS  quiet needed since the last transcript write (120)
 #   AGENT_IDLE_SAMPLE_SECS  length of the live activity sample  (default 30)
-#   AGENT_IDLE_CPU_TICKS    max CPU ticks over that sample      (default 20)
 #   AGENT_KEEP_VERSIONS     harness builds to retain            (default 3)
+#   AGENT_FETCH_MIN_SECS    min gap between `claude update` runs (default 20h)
 #   AGENT_DEFER_WARN_HOURS  warn if drift persists this long    (default 24)
 #   AGENT_DEFER_MAX_HOURS   restart anyway past this            (default 48)
 #   AGENT_IDLE_QUIET_SECS   deprecated alias for _SETTLE_SECS
@@ -31,14 +43,15 @@ AGENT_UPDATE_MODE="${AGENT_UPDATE_MODE:-auto}"
 # set it in run.conf, so it is honoured as the settle value rather than ignored.
 AGENT_IDLE_SETTLE_SECS="${AGENT_IDLE_SETTLE_SECS:-${AGENT_IDLE_QUIET_SECS:-120}}"
 AGENT_IDLE_SAMPLE_SECS="${AGENT_IDLE_SAMPLE_SECS:-30}"
-AGENT_IDLE_CPU_TICKS="${AGENT_IDLE_CPU_TICKS:-20}"
 AGENT_KEEP_VERSIONS="${AGENT_KEEP_VERSIONS:-3}"
+AGENT_FETCH_MIN_SECS="${AGENT_FETCH_MIN_SECS:-72000}"
 AGENT_DEFER_WARN_HOURS="${AGENT_DEFER_WARN_HOURS:-24}"
 AGENT_DEFER_MAX_HOURS="${AGENT_DEFER_MAX_HOURS:-48}"
 
 VERSIONS_DIR="$HOME/.local/share/claude/versions"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent"
 DEFER_MARKER="$STATE_DIR/update-deferred-since"
+FETCH_STAMP="$STATE_DIR/last-fetch"
 LOCK="$STATE_DIR/update-check.lock"
 
 mkdir -p "$STATE_DIR"
@@ -130,28 +143,41 @@ transcripts_settled() {
     [ "$_age" -ge "$AGENT_IDLE_SETTLE_SECS" ]
 }
 
-# One window, two signals: is the agent burning CPU, and is its transcript
-# actually growing? Growth is the honest form of the mtime test -- a real turn
-# appends bytes, bookkeeping does not. 0 idle, 1 active, 2 could not measure.
+# One window, one signal: is the transcript actually growing? A real turn
+# appends bytes; the harness's bookkeeping rewrites do not. That is what makes
+# growth the honest form of the old mtime test. 0 idle, 1 active, 2 could not
+# measure.
+#
+# There was a second arm here that sampled the agent's own CPU. It is gone, and
+# both reasons were measured on marvin 2026-08-27:
+#
+#   - Its floor sat above its own threshold. Five consecutive 30s samples of a
+#     provably idle agent (zero transcript growth, no terminal output for 7h)
+#     read 76, 88, 98, 78, 76 ticks against a limit of 20. It could not return
+#     "idle" on this box at any time, ever. It is what kept marvin on 2.1.243
+#     for three days after the mtime bug above was already fixed.
+#   - The case it was meant to cover, it never covered. Its stated job was the
+#     long tool call that appends nothing for minutes -- but during a build the
+#     cycles go to the compiler while `claude` blocks on a pipe, so the harness
+#     looks *more* idle mid-build, not less. The arm was load-bearing for
+#     nothing and wrong for everything.
+#
+# Raising the threshold was the obvious fix and is not the right one: busy
+# samples measured 270-378 ticks against an idle floor of 76-98, barely 3x
+# apart, so any constant is a guess that has to hold across three VMs and every
+# future harness build. A signal that needs per-box calibration to be correct is
+# not a signal. Resume is what makes deleting it affordable.
 activity_quiet() {
-    _pid=$1
     ACTIVITY_WITNESS=''
-    _cpu_a=$(awk '{print $14+$15}' "/proc/$_pid/stat" 2>/dev/null) || return 2
     _size_a=$(newest_size)
     sleep "$AGENT_IDLE_SAMPLE_SECS"
-    _cpu_b=$(awk '{print $14+$15}' "/proc/$_pid/stat" 2>/dev/null) || return 2
     _size_b=$(newest_size)
-    _ticks=$(( _cpu_b - _cpu_a ))
     _grew=$(( _size_b - _size_a ))
     if [ "$_grew" -gt 0 ]; then
         ACTIVITY_WITNESS="transcript grew ${_grew}B over a ${AGENT_IDLE_SAMPLE_SECS}s sample"
         return 1
     fi
-    if [ "$_ticks" -gt "$AGENT_IDLE_CPU_TICKS" ]; then
-        ACTIVITY_WITNESS="claude burned ${_ticks} CPU ticks (limit ${AGENT_IDLE_CPU_TICKS}) over ${AGENT_IDLE_SAMPLE_SECS}s"
-        return 1
-    fi
-    ACTIVITY_WITNESS="no transcript growth, ${_ticks} CPU ticks over ${AGENT_IDLE_SAMPLE_SECS}s"
+    ACTIVITY_WITNESS="no transcript growth over ${AGENT_IDLE_SAMPLE_SECS}s"
     return 0
 }
 
@@ -162,8 +188,11 @@ activity_quiet() {
 # nothing had established. Three deferrals in a week were indistinguishable
 # afterwards, which is why this took a 90-sample experiment to diagnose rather
 # than a journal read. A measurement that fails must say so in its own words.
+# The pid argument is retained for the caller's readability and for the log
+# line above; nothing in the gate reads /proc any more.
 is_idle() {
     _pid_arg=$1
+    [ -n "$_pid_arg" ] || return 1
     inbox_clear || { log "  busy: un-acked mail in the inbox"; return 1; }
 
     _rc=0; transcripts_settled || _rc=$?
@@ -173,12 +202,24 @@ is_idle() {
         *) log "  busy: $TRANSCRIPT_WITNESS (settle window ${AGENT_IDLE_SETTLE_SECS}s)"; return 1 ;;
     esac
 
-    _rc=0; activity_quiet "$_pid_arg" || _rc=$?
+    _rc=0; activity_quiet || _rc=$?
     case "$_rc" in
         0) log "  idle: $ACTIVITY_WITNESS"; return 0 ;;
-        2) log "  busy: could not sample /proc/$_pid_arg/stat -- refusing to guess"; return 1 ;;
         *) log "  busy: $ACTIVITY_WITNESS"; return 1 ;;
     esac
+}
+
+# --- fetch cadence ---------------------------------------------------------
+# True when the last `claude update` was long enough ago. An unreadable or
+# malformed stamp means "fetch" -- the failure mode of fetching too often is a
+# wasted HTTP call, of fetching too rarely is a box that never updates.
+fetch_due() {
+    [ -f "$FETCH_STAMP" ] || return 0
+    _last=$(cat "$FETCH_STAMP" 2>/dev/null || echo 0)
+    case "$_last" in '' | *[!0-9]*) return 0 ;; esac
+    _now=$(date +%s)
+    case "$_now" in '' | *[!0-9]*) return 0 ;; esac
+    [ $(( _now - _last )) -ge "$AGENT_FETCH_MIN_SECS" ]
 }
 
 # --- pruning ---------------------------------------------------------------
@@ -204,9 +245,15 @@ main() {
     # nothing else reloads them.
     systemctl --user daemon-reload 2>/dev/null || true
 
-    if [ "$AGENT_UPDATE_MODE" = auto ]; then
+    # The tick is hourly; the fetch is not. `claude update` is a network call
+    # against an upstream the whole fleet shares, and nothing about checking for
+    # drift requires re-fetching first -- the drift being checked is between the
+    # running process and what is ALREADY on disk. So they are decoupled: fetch
+    # on its own ~daily stamp, check drift every tick.
+    if [ "$AGENT_UPDATE_MODE" = auto ] && fetch_due; then
         in_agent_env claude update 2>&1 | sed 's/^/agent-update:   /' >&2 ||
             log "claude update failed; continuing with what is on disk"
+        date +%s > "$FETCH_STAMP"
     fi
 
     pid=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1 || true)
@@ -274,7 +321,11 @@ main() {
         return 0
     fi
 
-    if [ "$hours" -ge "$AGENT_DEFER_WARN_HOURS" ]; then
+    # Once per AGENT_DEFER_WARN_HOURS, not once per tick. The tick is hourly now,
+    # and a warning that repeats 24 times a day is one nobody reads -- which was
+    # already this line's problem back when it fired daily.
+    if [ "$hours" -ge "$AGENT_DEFER_WARN_HOURS" ] &&
+       [ $(( hours % AGENT_DEFER_WARN_HOURS )) -eq 0 ]; then
         log "WARNING: drift deferred for ${hours}h -- the box has not been idle since. Restart by hand: systemctl --user restart agent-claude.service"
     else
         log "busy -- deferring to the next tick (drift ${hours}h old)"

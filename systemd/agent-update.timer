@@ -1,12 +1,19 @@
 [Unit]
-Description=Daily harness update check for the supervised agent
+Description=Hourly harness update check for the supervised agent
 
 [Timer]
 Unit=agent-update.service
 OnBootSec=2min
-OnCalendar=daily
-# The fleet shares an upstream; do not have every VM fetch at the same instant.
-RandomizedDelaySec=30min
+# Hourly, not daily. The check is cheap (the network fetch is gated separately
+# inside agent-update-check.sh on its own ~daily stamp), and the cadence is the
+# whole point: a single false "busy" used to cost a full day, which is how a box
+# stays on a stale harness for a week. At this rate a missed window costs an
+# hour, and the AGENT_DEFER_MAX_HOURS ceiling lands within an hour of its mark
+# instead of depending on where the jitter fell.
+OnCalendar=hourly
+# The fleet shares an upstream; do not have every VM tick at the same instant.
+# Small, because it no longer has to be smaller than the window it might miss.
+RandomizedDelaySec=5min
 Persistent=true
 AccuracySec=1m
 

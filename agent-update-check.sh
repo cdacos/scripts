@@ -357,10 +357,21 @@ main() {
     fi
 
     # Compare fully resolved paths, not basenames. A native install resolves both
-    # sides to versions/<v>, but not every box is native: tweety's claude is
-    # /usr/bin/claude with no versions/ dir at all. Basenames there would read
-    # "claude" vs "claude" or "claude" vs "unknown" -- either a missed update or,
-    # worse, permanent phantom drift restarting the agent every day forever.
+    # sides to versions/<v>; a packaged one (/usr/bin/claude, no versions/ dir)
+    # resolves to neither. Basenames there would read "claude" vs "claude" or
+    # "claude" vs "unknown" -- either a missed update or, worse, permanent phantom
+    # drift restarting the agent every day forever.
+    #
+    # This guard is written against the SHAPE of a packaged install, deliberately
+    # and not against any particular box. It used to cite tweety as the live
+    # counterexample; tweety has since been migrated and is native as of
+    # 2026-08-27 (reported by Tweety-8: ~/.local/bin/claude -> versions/2.1.247).
+    # The citation is removed rather than updated, because a rationale that rests
+    # on one named machine reads as obsolete the moment that machine changes, and
+    # invites someone to simplify this back to basenames on the grounds that the
+    # case is now hypothetical. It is not: any non-native install reintroduces it,
+    # and the failure mode is a daily restart loop that looks like a working
+    # updater. (Flagged by Tweety-8, who noticed its own box had falsified it.)
     running_path=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
     installed_path=$(in_agent_env sh -c 'command -v claude' 2>/dev/null || true)
     [ -n "$installed_path" ] && installed_path=$(readlink -f "$installed_path" 2>/dev/null || true)

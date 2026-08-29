@@ -223,13 +223,17 @@ start_container() {
     if [ -d "${HOME}/.claude" ]; then
         info "Copying ~/.claude config into container..."
         docker exec -u root "$container_name" mkdir -p /home/dev/.claude
-        tar -cf - -C "${HOME}/.claude" \
-            --include='./settings.json' \
-            --include='./CLAUDE.md' \
-            --include='./.credentials.json' \
-            --include='./skills' --include='./skills/*' \
-            --include='./plugins' --include='./plugins/*' \
-            . | docker exec -i -u root "$container_name" tar -xf - -C /home/dev/.claude
+        # GNU tar has no --include; archive an explicit list of only the
+        # entries that exist (tar errors out on a missing path, which would
+        # silently abort the whole copy mid-pipeline under `set -e`).
+        copy_items=""
+        for item in settings.json CLAUDE.md .credentials.json skills plugins; do
+            [ -e "${HOME}/.claude/${item}" ] && copy_items="$copy_items $item"
+        done
+        if [ -n "$copy_items" ]; then
+            ( cd "${HOME}/.claude" && tar -cf - $copy_items ) \
+                | docker exec -i -u root "$container_name" tar -xf - -C /home/dev/.claude
+        fi
         docker exec -u root "$container_name" chown -R dev:dev /home/dev/.claude
     fi
 }
@@ -292,6 +296,34 @@ find_worktree() {
     return 1
 }
 
+# Return 0 if TCP port already bound on host (covers docker-published ports,
+# which appear as docker-proxy listeners — the case find_next_port can't see by
+# scanning worktree dirs alone).
+port_in_use() {
+    p="$1"
+    if command -v ss >/dev/null 2>&1; then
+        # Linux
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${p}\$" && return 0
+    elif command -v lsof >/dev/null 2>&1; then
+        # macOS / BSD (no ss)
+        lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    fi
+    # Belt-and-suspenders everywhere: docker-published host ports.
+    docker ps --format '{{.Ports}}' 2>/dev/null | grep -qE "(^|[^0-9])${p}->" && return 0
+    return 1
+}
+
+# Advance a candidate port past any host-allocated port (max 65535).
+next_free_port() {
+    candidate="$1"
+    while port_in_use "$candidate"; do
+        [ "$candidate" -ge 65535 ] && error "No free port available"
+        printf "${YELLOW}Port %s in use, trying %s...${NC}\n" "$candidate" "$((candidate + 1))" >&2
+        candidate=$((candidate + 1))
+    done
+    echo "$candidate"
+}
+
 # Find next available port
 find_next_port() {
     repo_root="$1"
@@ -328,9 +360,9 @@ find_next_port() {
             error "Port must be between 1024 and 65535"
         fi
 
-        echo "$start_port"
+        next_free_port "$start_port"
     else
-        echo $((max_port + 1))
+        next_free_port $((max_port + 1))
     fi
 }
 

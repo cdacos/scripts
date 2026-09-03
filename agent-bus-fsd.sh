@@ -526,12 +526,19 @@ do_read() {
 
     # Content rides in meta, not body: the bus rejects an empty body, so an
     # empty file would otherwise 400, and a topic feed should not have whole
-    # source files dumped into it. jq slurps the file whole, so a trailing
-    # newline survives -- command substitution only trims the quoted literal.
-    _content=$(jq -R -s '.' <"$_file")
+    # source files dumped into it.
+    #
+    # --rawfile, not --arg or --argjson: a single argv entry is capped at
+    # MAX_ARG_STRLEN, which is 128 KiB and has nothing to do with the much
+    # larger ARG_MAX everyone reaches for. Every text file between that and the
+    # 256 KiB MAX_INLINE therefore died with "Argument list too long" on a
+    # stderr nobody reads, published nothing, and left the tab spinning until
+    # its 20s timeout -- ten real files under this root, one of them a plan doc.
+    # Passing the path lets jq read the bytes itself, and it still slurps the
+    # file whole, so a trailing newline survives.
     jq -n --arg rid "$_rid" --arg agent "$ME" --arg path "$_logical" \
         --arg lang "$_lang" --arg name "$_name" --argjson size "$_size" \
-        --argjson content "$_content" '
+        --rawfile content "$_file" '
         {body: ($name + " (" + ($size | tostring) + " bytes)"),
          meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
                 op: "read", path: $path, mode: "inline", size: $size,

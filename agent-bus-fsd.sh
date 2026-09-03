@@ -901,29 +901,70 @@ git_bounded() {
     fi
 }
 
+# logical_roots -- prints "<logical>TAB<resolved>" for the served root (whose
+# logical path is empty) and for each of its direct children.
+#
+# The same set of prefixes safe_path allows, and for the same reason, but paired
+# with the name each one is reached by. Resolving alone is not enough here: the
+# answer has to be a path the UI can hand back as fs.read or fs.gitdiff, and
+# that is the logical one.
+logical_roots() {
+    printf '%s%s\n' "$TAB" "$ROOT"
+    for _e in "$ROOT"/*; do
+        [ -e "$_e" ] || continue
+        _r=$(canon "$_e")
+        [ -n "$_r" ] || continue
+        printf '%s%s%s\n' "${_e##*/}" "$TAB" "$_r"
+    done
+}
+
 # git_repo_root <dir> -> the repo root as a logical path (empty when the served
-# root is itself a repo), non-zero when <dir> is in no repo at all.
+# root is itself a repo), non-zero when <dir> is in no repo this daemon serves.
 git_repo_root() {
     _top=$(git_bounded git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
     [ -n "$_top" ] || return 1
     _top=$(canon "$_top")
     [ -n "$_top" ] || return 1
-    # A repo whose root sits ABOVE the served root is not ours to describe. Its
+    # Matched against every prefix safe_path allows, not merely against the
+    # served root, because a direct child may be a symlink out of the tree --
+    # on this box dotfiles -> ~/.local/share/chezmoi and marvin-memories ->
+    # ~/.claude/... are two of the six repos. Those links are deliberate and
+    # browsing already treats them as part of the tree, so reporting "no repo"
+    # for them left the root menu offering a door that opened onto nothing.
+    #
+    # A repo whose root sits above ALL of those prefixes is still refused: its
     # branch is a fact about a tree the operator did not offer, and its changed
-    # files would name paths this daemon is obliged to refuse -- so a root of
-    # ~/src/foo inside a ~ repo reports "no repo" rather than leaking the shape
-    # of the checkout above it.
-    case "$_top" in
-        "$ROOT")
-            printf '\n'
-            return 0
-            ;;
-        "$ROOT"/*)
-            printf '%s\n' "${_top#"$ROOT"/}"
-            return 0
-            ;;
-        *) return 1 ;;
-    esac
+    # files would name paths this daemon is obliged to refuse.
+    #
+    # "/" is the sentinel for "the served root itself", because an empty line
+    # and no line at all are indistinguishable through a command substitution,
+    # and it is the one byte a path component can never contain.
+    _hit=$(
+        logical_roots | while IFS="$TAB" read -r _lg _rs; do
+            [ -n "$_rs" ] || continue
+            case "$_top" in
+                "$_rs")
+                    printf '%s\n' "${_lg:-/}"
+                    break
+                    ;;
+                "$_rs"/*)
+                    _sub="${_top#"$_rs"/}"
+                    if [ -n "$_lg" ]; then
+                        printf '%s/%s\n' "$_lg" "$_sub"
+                    else
+                        printf '%s\n' "$_sub"
+                    fi
+                    break
+                    ;;
+            esac
+        done
+    )
+    [ -n "$_hit" ] || return 1
+    if [ "$_hit" = "/" ]; then
+        printf '\n'
+    else
+        printf '%s\n' "$_hit"
+    fi
 }
 
 # git_branch <repodir> -- prints "<detached>TAB<name>": false and the branch

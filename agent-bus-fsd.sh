@@ -19,7 +19,7 @@
 
 set -e
 
-FSD_VERSION=2
+FSD_VERSION=3
 
 # A literal tab and newline, for splitting and for rejecting filenames that
 # would corrupt the TSV the listing pass parses.
@@ -52,6 +52,8 @@ Environment:
   AGENT_BUS_FS_MAX_ENTRIES Directory entries per listing           (default 2000)
   AGENT_BUS_FS_MAX_HITS    Search matches returned per query       (default 200)
   AGENT_BUS_FS_GREP_TIMEOUT  Seconds one search may run            (default 15)
+  AGENT_BUS_FS_GIT_TIMEOUT   Seconds one git command may run       (default 10)
+  AGENT_BUS_FS_GIT_BASE    Branch the git panel compares against   (default main)
   AGENT_BUS_FS_GITIGNORE   Withhold gitignored files and .git       (default 1)
   AGENT_BUS_FS_AGENT       Answer as this agent name     (default: from /whoami)
 
@@ -77,6 +79,13 @@ What is NOT served, unless AGENT_BUS_FS_GITIGNORE=0:
     .gitignore'd files while serving .git would be theatre.
 Tracked file contents are otherwise served raw, with no redaction. Anything
 committed is on the remote already; the gitignored layer is not.
+
+The git ops (fs.git, fs.gitdiff) back the web UI's branch panel: which repo a
+path is in, its branch, which files differ from AGENT_BUS_FS_GIT_BASE, and one
+file's diff. The comparison is merge-base(base, HEAD) against the working tree,
+so it shows this branch's own work -- committed and not -- and never the commits
+the base has gained since. Read-only: nothing here writes the index, so browsing
+cannot disturb an agent working in the same checkout.
 
 Search (fs.grep) uses ripgrep when a real rg binary is on PATH, otherwise
 `git grep --no-index --exclude-standard`, and plain grep only where there is no
@@ -121,6 +130,8 @@ require_env() {
     MAX_ENTRIES="${AGENT_BUS_FS_MAX_ENTRIES:-2000}"
     MAX_HITS="${AGENT_BUS_FS_MAX_HITS:-200}"
     GREP_TIMEOUT="${AGENT_BUS_FS_GREP_TIMEOUT:-15}"
+    GIT_TIMEOUT="${AGENT_BUS_FS_GIT_TIMEOUT:-10}"
+    GIT_BASE="${AGENT_BUS_FS_GIT_BASE:-main}"
     GITIGNORE="${AGENT_BUS_FS_GITIGNORE:-1}"
 
     # Resolved once rather than per query: which engine is available is a
@@ -263,6 +274,43 @@ safe_path() {
     [ "$_hit" = "ok" ] || return 1
 
     printf '%s\n' "$_real"
+}
+
+# safe_logical <logical> -> "$ROOT/<cleaned>" without testing existence.
+#
+# safe_path refuses anything that is not on disk, which is right for reading and
+# listing and wrong for a diff: a file DELETED on this branch is precisely what
+# you want to look at. So this does the half of the job that does not need the
+# filesystem -- strip leading slashes, refuse a ".." component -- and leaves
+# containment to the caller. Only do_gitdiff may use it, and only because the
+# result never reaches open(2): it goes to git as a pathspec, resolved against
+# the index and trees of a repo already proved to sit under the served root.
+safe_logical() {
+    _p="$1"
+    while :; do
+        case "$_p" in
+            /*) _p="${_p#/}" ;;
+            *) break ;;
+        esac
+    done
+    _rest="$_p"
+    while [ -n "$_rest" ]; do
+        case "$_rest" in
+            */*)
+                _seg="${_rest%%/*}"
+                _rest="${_rest#*/}"
+                ;;
+            *)
+                _seg="$_rest"
+                _rest=""
+                ;;
+        esac
+        if [ "$_seg" = ".." ]; then
+            return 1
+        fi
+    done
+    [ -n "$_p" ] || return 1
+    printf '%s/%s\n' "$ROOT" "$_p"
 }
 
 # --- Exclusions -------------------------------------------------------------
@@ -809,13 +857,414 @@ do_grep() {
 # it, but naming the ops means the next capability needs no new field.
 do_ping() {
     jq -n --arg rid "$1" --arg agent "$ME" --arg root "$ROOT" \
-        --arg engine "$(grep_engine)" \
+        --arg engine "$(grep_engine)" --arg gitbase "$GIT_BASE" \
         --argjson version "$FSD_VERSION" '
         {body: ($agent + " serving " + $root),
          meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
                 op: "ping", root: $root, version: $version,
-                ops: ["list", "read", "ping", "grep"], engine: $engine}}' |
+                ops: ["list", "read", "ping", "grep", "git", "gitdiff"],
+                gitbase: $gitbase, engine: $engine}}' |
         publish_rsp
+}
+
+# --- Git --------------------------------------------------------------------
+#
+# Two ops behind the UI's branch panel: fs.git names the repo a path sits in
+# and lists what differs from the base branch, fs.gitdiff returns one file's
+# diff. Both are strictly read-only -- no add, no stash, no checkout, nothing
+# that writes the index -- because an agent is very likely working in the same
+# checkout while somebody browses it, and a browser must not be able to disturb
+# a colleague's tree.
+#
+# The comparison is merge-base(BASE, HEAD) against the WORKING TREE, chosen
+# deliberately over the two obvious alternatives:
+#
+#   - against BASE's tip rather than the merge base, which would report every
+#     commit the base gained since you branched as though it were your change;
+#   - against HEAD rather than the working tree, which would hide uncommitted
+#     edits -- and then the "view file" link, which serves what is on disk,
+#     would show content the diff had just claimed was not there.
+#
+# So the panel and the plain-file view always describe the same bytes. A repo
+# sitting on the base branch itself has merge-base == HEAD, which makes the
+# list exactly its uncommitted work; that is the right answer and not a
+# special case.
+
+# Bounded like search is, and for the same reason: a diff against the working
+# tree stats every tracked file, so a cold cache on a large repo is slow enough
+# to outlive the UI's own wait if a disk is struggling.
+git_bounded() {
+    if [ -n "$TIMEOUT_BIN" ]; then
+        "$TIMEOUT_BIN" "$GIT_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
+# git_repo_root <dir> -> the repo root as a logical path (empty when the served
+# root is itself a repo), non-zero when <dir> is in no repo at all.
+git_repo_root() {
+    _top=$(git_bounded git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+    [ -n "$_top" ] || return 1
+    _top=$(canon "$_top")
+    [ -n "$_top" ] || return 1
+    # A repo whose root sits ABOVE the served root is not ours to describe. Its
+    # branch is a fact about a tree the operator did not offer, and its changed
+    # files would name paths this daemon is obliged to refuse -- so a root of
+    # ~/src/foo inside a ~ repo reports "no repo" rather than leaking the shape
+    # of the checkout above it.
+    case "$_top" in
+        "$ROOT")
+            printf '\n'
+            return 0
+            ;;
+        "$ROOT"/*)
+            printf '%s\n' "${_top#"$ROOT"/}"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# git_branch <repodir> -- prints "<detached>TAB<name>": false and the branch
+# name, or true and the short sha when HEAD is detached.
+#
+# Both facts come back on stdout rather than one of them in a global, because
+# every caller here is a command substitution and a subshell cannot write its
+# parent's variables -- a global would read as empty at exactly the point jq
+# demands a boolean. An unborn HEAD (a fresh repo, no commit) has a symbolic ref
+# and no sha, so it reports its branch name and fails the base lookup below
+# rather than here.
+git_branch() {
+    _b=$(git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    if [ -n "$_b" ]; then
+        printf 'false\t%s\n' "$_b"
+        return 0
+    fi
+    printf 'true\t%s\n' "$(git -C "$1" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+}
+
+# git_branch_name <repodir> -- just the name half, for a caller that does not
+# care whether HEAD is attached.
+git_branch_name() {
+    _bi=$(git_branch "$1")
+    printf '%s\n' "${_bi#*"$TAB"}"
+}
+
+# git_base_ref <repodir> -- the ref the comparison will actually use.
+#
+# Local heads only, never origin/*: a remote-tracking ref is as stale as the
+# last fetch, and a panel that quietly compares against a week-old idea of the
+# base is worse than one that says the base is missing. "master" is tried after
+# the configured name so a repo that predates the rename still gets a panel.
+git_base_ref() {
+    for _r in "$GIT_BASE" master; do
+        [ -n "$_r" ] || continue
+        if git -C "$1" rev-parse --verify --quiet "refs/heads/$_r" >/dev/null 2>&1; then
+            printf '%s\n' "$_r"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# git_changed <repodir> <mergebase> -- prints "<status>\t<path>" per changed
+# file, paths relative to the repo root.
+#
+# --no-renames on purpose. Rename detection emits a third field and a similarity
+# score, which the two-field parse below would have to special-case; and in a
+# panel whose rows are per-file diffs, "the old path was deleted, the new one
+# added" is both true and separately clickable, where one R row hides half of
+# what changed behind a name you can no longer open.
+#
+# Untracked files are appended as A, and always with --exclude-standard even
+# when AGENT_BUS_FS_GITIGNORE is off. An ignored file is not a change to the
+# branch -- it is a build output -- and a node_modules that would drown the
+# panel in ten thousand rows is not made more relevant by the operator having
+# opted to serve it.
+git_changed() {
+    git_bounded git -C "$1" diff --name-status --no-renames "$2" -- 2>/dev/null || true
+    git_bounded git -C "$1" ls-files --others --exclude-standard 2>/dev/null |
+        while IFS= read -r _o; do
+            [ -n "$_o" ] || continue
+            printf 'A\t%s\n' "$_o"
+        done
+}
+
+# git_meta_json <repodir> <logical repo path> -- resolves branch and base and
+# prints them as a JSON object, or an object carrying only "baseerr" when there
+# is nothing to compare against. Shared by both ops so a diff can never be
+# taken against a base the panel above it disagrees with.
+git_meta_json() {
+    _rdir="$1"
+    _rp="$2"
+    _bi=$(git_branch "$_rdir")
+    GIT_DETACHED="${_bi%%"$TAB"*}"
+    _br="${_bi#*"$TAB"}"
+    if ! _bs=$(git_base_ref "$_rdir"); then
+        jq -n --arg repo "$_rp" --arg branch "$_br" --arg want "$GIT_BASE" \
+            --argjson detached "$GIT_DETACHED" '
+            {repo: $repo, branch: $branch, detached: $detached, base: null,
+             baseerr: ("no " + $want + " branch in this repo to compare against")}'
+        return 0
+    fi
+    _mb=$(git_bounded git -C "$_rdir" merge-base "$_bs" HEAD 2>/dev/null || true)
+    if [ -z "$_mb" ]; then
+        # Unrelated histories, or a HEAD with no commit behind it yet.
+        jq -n --arg repo "$_rp" --arg branch "$_br" --arg bs "$_bs" \
+            --argjson detached "$GIT_DETACHED" '
+            {repo: $repo, branch: $branch, detached: $detached, base: $bs,
+             baseerr: ($branch + " and " + $bs + " share no history")}'
+        return 0
+    fi
+    jq -n --arg repo "$_rp" --arg branch "$_br" --arg bs "$_bs" --arg mb "$_mb" \
+        --argjson detached "$GIT_DETACHED" '
+        {repo: $repo, branch: $branch, detached: $detached, base: $bs,
+         mergebase: $mb, baseerr: null}'
+}
+
+# do_git_repos <rid> <logical> <dir> -- the reply for a directory that is in no
+# repo, which on a multi-repo root is the root itself. Direct children only:
+# one level is what makes it a menu of branches rather than a recursive crawl,
+# and a repo nested deeper is reached by clicking into it.
+do_git_repos() {
+    _rid="$1"
+    _logical="$2"
+    _dir="$3"
+    _rows=""
+    for _e in "$_dir"/*; do
+        [ -d "$_e" ] || continue
+        [ -e "$_e/.git" ] || continue
+        _n="${_e##*/}"
+        case "$_logical" in
+            "") _rp="$_n" ;;
+            *) _rp="$_logical/$_n" ;;
+        esac
+        _br=$(git_branch_name "$_e")
+        _cnt=""
+        if _bs=$(git_base_ref "$_e"); then
+            _mb=$(git_bounded git -C "$_e" merge-base "$_bs" HEAD 2>/dev/null || true)
+            if [ -n "$_mb" ]; then
+                # The same filter the listing applies, so a repo cannot
+                # advertise six changes and then show five: a path git had to
+                # quote is unlistable, and counting it here would make the
+                # menu disagree with the panel it leads to.
+                _cnt=$(git_changed "$_e" "$_mb" | cut -f2 | grep -cv '^"' || true)
+            fi
+        fi
+        # Tab-separated and newline-joined, then split in jq: a repo directory
+        # name containing either would be dropped rather than shifting every
+        # field after it, the same rule the listing applies.
+        _rows="$_rows$_rp$TAB$_br$TAB$_cnt$NL"
+    done
+    printf '%s' "$_rows" | jq -R -s \
+        --arg rid "$_rid" --arg agent "$ME" --arg path "$_logical" '
+        (split("\n") | map(select(length > 0)) | map(split("\t"))
+         | map(select(length == 3))
+         | map({path: .[0], branch: .[1],
+                changed: (.[2] | if . == "" then null else tonumber? end)})
+         | sort_by(.path | ascii_downcase)) as $repos
+        | {body: ("git: " + ($repos | length | tostring) + " repos under "
+                  + (if $path == "" then "." else $path end)),
+           meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
+                  op: "git", path: $path, repo: null, repos: $repos}}' |
+        publish_rsp
+}
+
+# do_git <rid> <logical> <resolved>
+do_git() {
+    _rid="$1"
+    _logical="$2"
+    _real="$3"
+    [ -n "$GIT_BIN" ] || {
+        reply_error "$_rid" "git is not installed on this box"
+        return
+    }
+    if [ -d "$_real" ]; then
+        _dir="$_real"
+        _dlog="$_logical"
+    else
+        _dir=$(dirname -- "$_real")
+        case "$_logical" in
+            */*) _dlog="${_logical%/*}" ;;
+            *) _dlog="" ;;
+        esac
+    fi
+    if ! _repo=$(git_repo_root "$_dir"); then
+        do_git_repos "$_rid" "$_dlog" "$_dir"
+        return
+    fi
+    if [ -n "$_repo" ]; then
+        _rdir="$ROOT/$_repo"
+    else
+        _rdir="$ROOT"
+    fi
+    _info=$(git_meta_json "$_rdir" "$_repo")
+    if [ -z "$_info" ]; then
+        reply_error "$_rid" "could not read git state for ${_repo:-the served root}"
+        return
+    fi
+    if [ "$(printf '%s' "$_info" | jq -r '.baseerr // empty')" != "" ]; then
+        printf '%s' "$_info" | jq \
+            --arg rid "$_rid" --arg agent "$ME" --arg path "$_logical" '
+            . as $i
+            | {body: ("git: " + $i.branch + " — " + $i.baseerr),
+               meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
+                      op: "git", path: $path, repo: $i.repo, branch: $i.branch,
+                      detached: $i.detached, base: $i.base, baseerr: $i.baseerr,
+                      files: []}}' |
+            publish_rsp
+        return
+    fi
+    _mb=$(printf '%s' "$_info" | jq -r '.mergebase')
+    _changed=$(git_changed "$_rdir" "$_mb")
+
+    printf '%s' "$_changed" | jq -R -s \
+        --arg rid "$_rid" --arg agent "$ME" --arg path "$_logical" \
+        --argjson info "$_info" --argjson max "$MAX_ENTRIES" \
+        --arg prefix "${_repo:+$_repo/}" '
+        (split("\n") | map(select(length > 0))) as $lines
+        # A path git had to quote (one holding a tab, a newline or a control
+        # character) arrives wrapped in double quotes and C-escaped, so the
+        # name in it is not the name on disk and clicking it would 404. Dropped
+        # rather than mangled -- but counted, because a panel that silently
+        # omits a changed file is the one thing worse than one that says it did.
+        | ($lines | map(split("\t")) | map(select(length == 2))) as $rows
+        | ($rows | map(select((.[1] | startswith("\"")) | not))) as $ok
+        | (($lines | length) - ($ok | length)) as $skipped
+        | ($ok | map({status: .[0][0:1], rel: .[1], path: ($prefix + .[1])})
+               | sort_by(.rel | ascii_downcase)) as $all
+        | ($all | length > $max) as $trunc
+        | {body: ("git: " + $info.branch + ", "
+                  + ($all | length | tostring) + " file(s) vs " + $info.base),
+           meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
+                  op: "git", path: $path, repo: $info.repo,
+                  branch: $info.branch, detached: $info.detached,
+                  base: $info.base, mergebase: $info.mergebase,
+                  files: $all[0:$max], trunc: $trunc, skipped: $skipped}}' |
+        publish_rsp
+}
+
+# do_gitdiff <rid> <logical>
+#
+# Takes the logical path itself rather than a resolved one, because a DELETED
+# file is exactly the interesting case and safe_path insists on existence. That
+# is safe here only because the path never reaches open(2): it is used solely as
+# a git pathspec inside a repo whose root has already been proved to sit under
+# the served root, and git resolves a pathspec against its own index and trees
+# rather than by walking the filesystem. A ".." component is still refused, and
+# the file is still put through the .gitignore rule whenever it exists on disk.
+do_gitdiff() {
+    _rid="$1"
+    _logical="$2"
+    [ -n "$GIT_BIN" ] || {
+        reply_error "$_rid" "git is not installed on this box"
+        return
+    }
+    if ! _full=$(safe_logical "$_logical"); then
+        reply_error "$_rid" "no such path under the served root: $_logical"
+        return
+    fi
+    if [ -e "$_full" ] && _why=$(path_excluded "$_full"); then
+        reply_error "$_rid" "$_why"
+        return
+    fi
+    # Walk up to the nearest directory that still exists: a file deleted along
+    # with its directory has no dirname to ask about.
+    _dir=$(dirname -- "$_full")
+    while [ ! -d "$_dir" ]; do
+        case "$_dir" in
+            "$ROOT" | "$ROOT"/*) ;;
+            *) break ;;
+        esac
+        _dir=$(dirname -- "$_dir")
+    done
+    if [ ! -d "$_dir" ] || ! _repo=$(git_repo_root "$_dir"); then
+        reply_error "$_rid" "$_logical is not inside a repo"
+        return
+    fi
+    if [ -n "$_repo" ]; then
+        _rdir="$ROOT/$_repo"
+        _rel="${_full#"$ROOT/$_repo/"}"
+    else
+        _rdir="$ROOT"
+        _rel="${_full#"$ROOT/"}"
+    fi
+    _info=$(git_meta_json "$_rdir" "$_repo")
+    if [ -z "$_info" ]; then
+        reply_error "$_rid" "could not read git state for ${_repo:-the served root}"
+        return
+    fi
+    _be=$(printf '%s' "$_info" | jq -r '.baseerr // empty')
+    if [ -n "$_be" ]; then
+        reply_error "$_rid" "$_be"
+        return
+    fi
+    _base=$(printf '%s' "$_info" | jq -r '.base')
+    _mb=$(git_bounded git -C "$_rdir" merge-base "$_base" HEAD 2>/dev/null || true)
+    [ -n "$_mb" ] || {
+        reply_error "$_rid" "cannot resolve a merge base with $_base"
+        return
+    }
+
+    _st=$(git_bounded git -C "$_rdir" diff --name-status --no-renames "$_mb" -- "$_rel" 2>/dev/null |
+        head -n 1 | cut -f1 | cut -c1)
+    # One byte past the limit, so that "did it fit" is answerable without
+    # holding a 40 MB diff in a shell variable to find out. The SIGPIPE head
+    # induces at the cap is why every one of these ends in `|| true`.
+    _cap=$((MAX_INLINE + 1))
+    _diff=$(git_bounded git -C "$_rdir" diff "$_mb" -- "$_rel" 2>/dev/null |
+        head -c "$_cap" || true)
+    _untracked=false
+    # Only now, and only for a path git has never heard of. An untracked file is
+    # in no tree, so the diff above has nothing to say about it; --no-index
+    # against /dev/null renders it as the wholly-added file it is, exiting 1
+    # because the two differ, which here is the expected outcome.
+    #
+    # Both halves of the test are needed. Asking the index alone ("is it
+    # tracked?") calls a `git rm`-ed file untracked -- it left the index too --
+    # and answers an empty --no-index diff for the deletion that is the whole
+    # reason this op takes a lexical path.
+    if [ -z "$_diff" ] && [ -f "$_full" ] &&
+        ! git -C "$_rdir" ls-files --error-unmatch -- "$_rel" >/dev/null 2>&1 &&
+        ! git -C "$_rdir" cat-file -e "$_mb:$_rel" 2>/dev/null; then
+        _untracked=true
+        _st=A
+        _diff=$(git_bounded git -C "$_rdir" diff --no-index -- /dev/null "$_rel" 2>/dev/null |
+            head -c "$_cap" || true)
+    fi
+
+    _trunc=false
+    if [ "${#_diff}" -gt "$MAX_INLINE" ]; then
+        # Cut back to a line boundary: half a diff line renders as a phantom
+        # change, and a trailing "+" with nothing after it reads as a bug.
+        _diff=$(printf '%s\n' "$_diff" | sed '$d')
+        _trunc=true
+    fi
+
+    # Spooled rather than passed, for the MAX_ARG_STRLEN reason spelt out in
+    # do_read: a diff is exactly the kind of payload that clears 128 KiB, and
+    # the failure is a silent one.
+    _dtmp=$(mktemp "${TMPDIR:-/tmp}/agent-bus-fsd-diff.XXXXXX") || {
+        reply_error "$_rid" "mktemp failed"
+        return
+    }
+    printf '%s' "$_diff" >"$_dtmp"
+
+    printf '%s' "$_info" | jq \
+        --arg rid "$_rid" --arg agent "$ME" --arg path "$_logical" \
+        --arg rel "$_rel" --arg st "$_st" --rawfile diff "$_dtmp" \
+        --argjson untracked "$_untracked" --argjson trunc "$_trunc" '
+        . as $i
+        | {body: ("git diff " + $path + " vs " + $i.base
+                  + (if $diff == "" then " (identical)" else "" end)),
+           meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
+                  op: "gitdiff", path: $path, repo: $i.repo, rel: $rel,
+                  branch: $i.branch, base: $i.base, mergebase: $i.mergebase,
+                  status: (if $st == "" then null else $st end),
+                  untracked: $untracked, diff: $diff, trunc: $trunc}}' |
+        publish_rsp
+    rm -f "$_dtmp"
 }
 
 # --- Dispatch ---------------------------------------------------------------
@@ -825,7 +1274,7 @@ handle_request() {
     _msg="$1"
     _kind=$(printf '%s' "$_msg" | jq -r '.meta.kind // empty' 2>/dev/null || true)
     case "$_kind" in
-        fs.list | fs.read | fs.ping | fs.grep) ;;
+        fs.list | fs.read | fs.ping | fs.grep | fs.git | fs.gitdiff) ;;
         *) return 0 ;;
     esac
     # Case-insensitive: agents.json capitalises names, humans rarely do.
@@ -851,6 +1300,13 @@ handle_request() {
         return 0
     fi
 
+    # Ahead of safe_path, which would refuse the deleted file that is the whole
+    # point of asking for a diff. do_gitdiff does its own containment.
+    if [ "$_kind" = "fs.gitdiff" ]; then
+        do_gitdiff "$_rid" "$_path"
+        return 0
+    fi
+
     if ! _real=$(safe_path "$_path"); then
         # One message for "outside the root" and for "does not exist", on
         # purpose: telling them apart would let a caller map the filesystem
@@ -868,6 +1324,7 @@ handle_request() {
         fs.list) do_list "$_rid" "$_path" "$_real" ;;
         fs.read) do_read "$_rid" "$_path" "$_real" ;;
         fs.grep) do_grep "$_rid" "$_path" "$_real" "$_query" "$_regex" ;;
+        fs.git) do_git "$_rid" "$_path" "$_real" ;;
     esac
 }
 
@@ -1015,6 +1472,7 @@ case "${1:-serve}" in
     if [ -n "$RG_BIN" ] && [ "$RG_OK" != 1 ]; then
         printf '          WARNING: %s exists but failed the output-format probe\n' "$RG_BIN"
     fi
+        printf 'git     : base %s, bounded at %ss\n' "$GIT_BASE" "$GIT_TIMEOUT"
         printf 'roots   : %s allowed prefixes\n' "$(allowed_roots | wc -l | tr -d ' ')"
         if [ "$GITIGNORE" = 1 ]; then
             printf 'excluded: gitignored files and .git\n'

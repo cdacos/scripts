@@ -957,9 +957,23 @@ serve() {
     log "serving $ROOT as $ME ($REQ_TOPIC -> $RSP_TOPIC, lister $LISTER)"
     _backoff=1
     while :; do
+        _connected_at=$(date +%s)
         watch_once || true
         if [ "$ONCE" = "1" ]; then
             return 0
+        fi
+        # Reset after a connection that actually lasted, or the backoff is a
+        # one-way ratchet: it only ever climbs, so a bad hour last week pins
+        # every reconnect since at the cap, and a routine bus restart today
+        # costs 30s of silence instead of 1s. Silence is the entire cost --
+        # while this daemon is off the stream the bus drops nudges to absent
+        # subscribers with no queue, no retry and no log line anywhere, so a
+        # Files-tab click simply ceases to exist until the UI's 20s timeout.
+        # Duration rather than "we read a line", because a rejected connection
+        # still writes its error body into the FIFO: counting lines would read
+        # a 401 as success and reconnect at 1s forever.
+        if [ "$(($(date +%s) - _connected_at))" -ge 60 ]; then
+            _backoff=1
         fi
         log "stream ended; reconnecting in ${_backoff}s"
         sleep "$_backoff"

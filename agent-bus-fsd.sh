@@ -19,7 +19,7 @@
 
 set -e
 
-FSD_VERSION=4
+FSD_VERSION=5
 
 # A literal tab and newline, for splitting and for rejecting filenames that
 # would corrupt the TSV the listing pass parses.
@@ -91,9 +91,11 @@ disturb an agent working in the same checkout.
 
 The base defaults to a REMOTE-tracking ref, resolved per repo; git_base_ref()
 carries the measurements for why a local head was the wrong choice on a box
-whose agent never checks out main. Each reply also carries "baseage", seconds
-since that repo last fetched, so a base nobody has refreshed can be shown as
-stale instead of quietly inflating the diff.
+whose agent never checks out main. Every reply carries the base it used and
+"baseage", seconds since that repo last fetched -- the panel for one repo and
+(since v5) each row of the repo menu alike, because a menu row is a bare count
+and a bare count is the one number on screen you cannot check. A base nobody
+has refreshed is then shown as stale rather than quietly inflating the diff.
 
 Search (fs.grep) uses ripgrep when a real rg binary is on PATH, otherwise
 `git grep --no-index --exclude-standard`, and plain grep only where there is no
@@ -1173,7 +1175,16 @@ do_git_repos() {
         esac
         _br=$(git_branch_name "$_e")
         _cnt=""
+        _bs=""
+        _bage=""
+        # The base and its age ride along with the count because the count is
+        # meaningless without them. A menu row saying "65" is a claim about a
+        # comparison, and until now it named neither what it compared against
+        # nor how old that was -- so the one number on screen was the one thing
+        # you could not check. The panel below has carried both since v4; a
+        # menu that leads to the panel must not be less honest than it is.
         if _bs=$(git_base_ref "$_e"); then
+            _bage=$(git_base_age "$_e" "$_bs")
             _mb=$(git_bounded git -C "$_e" merge-base "$_bs" HEAD 2>/dev/null || true)
             if [ -n "$_mb" ]; then
                 # The same filter the listing applies, so a repo cannot
@@ -1186,14 +1197,16 @@ do_git_repos() {
         # Tab-separated and newline-joined, then split in jq: a repo directory
         # name containing either would be dropped rather than shifting every
         # field after it, the same rule the listing applies.
-        _rows="$_rows$_rp$TAB$_br$TAB$_cnt$NL"
+        _rows="$_rows$_rp$TAB$_br$TAB$_cnt$TAB$_bs$TAB$_bage$NL"
     done
     printf '%s' "$_rows" | jq -R -s \
         --arg rid "$_rid" --arg agent "$ME" --arg path "$_logical" '
         (split("\n") | map(select(length > 0)) | map(split("\t"))
-         | map(select(length == 3))
+         | map(select(length == 5))
          | map({path: .[0], branch: .[1],
-                changed: (.[2] | if . == "" then null else tonumber? end)})
+                changed: (.[2] | if . == "" then null else tonumber? end),
+                base: (.[3] | if . == "" then null else . end),
+                baseage: (.[4] | if . == "" then null else tonumber? end)})
          | sort_by(.path | ascii_downcase)) as $repos
         | {body: ("git: " + ($repos | length | tostring) + " repos under "
                   + (if $path == "" then "." else $path end)),

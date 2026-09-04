@@ -1,5 +1,5 @@
 #!/bin/sh
-# agent-update-check.sh - keep the *running* agent on the *installed* harness.
+# agent-update-check.sh - keep the *running* code on a box equal to the *installed* code.
 #
 # `claude update` fetches a new build into ~/.local/share/claude/versions/ and
 # moves the ~/.local/bin/claude symlink. The running process keeps its original
@@ -7,10 +7,16 @@
 # version it booted with, indefinitely. Measured on marvin 2026-08-22: PID 1525
 # still on 2.1.234 while the symlink had pointed at 2.1.238 since 21 Aug.
 #
+# The same inode argument applies to every long-lived process that runs from a
+# file, not just the harness -- see daemon_drift() for the fleet-wide capability
+# outage that proved it.
+#
 # Run by agent-update.timer. Restarts agent-claude.service when the box looks
 # idle -- see is_idle() for what that means and why it is imperfect -- and, past
 # AGENT_DEFER_MAX_HOURS, whether it looks idle or not. The ceiling exists because
 # the gate's proxies can be wrong in the direction of "busy" indefinitely.
+# Managed daemons (AGENT_MANAGED_UNITS) are restarted with no idle gate at all,
+# for reasons given at daemon_drift().
 #
 # The gate is deliberately cheap rather than clever, because agent-run.sh now
 # resumes the previous conversation (`--continue`). A badly-timed restart costs
@@ -36,6 +42,9 @@
 #   AGENT_DEFER_WARN_HOURS  warn if drift persists this long    (default 24)
 #   AGENT_DEFER_MAX_HOURS   restart anyway past this            (default 48)
 #   AGENT_IDLE_QUIET_SECS   deprecated alias for _SETTLE_SECS
+#   AGENT_MANAGED_UNITS     space-separated unit:script pairs whose daemon must
+#                           be restarted when its script changes underneath it
+#                           (default agent-fsd.service:~/.local/bin/agent-bus-fsd.sh)
 set -eu
 
 conf="${XDG_CONFIG_HOME:-$HOME/.config}/agent/run.conf"
@@ -53,6 +62,7 @@ AGENT_GUIDANCE_FETCH="${AGENT_GUIDANCE_FETCH:-1}"
 AGENT_GUIDANCE_TIMEOUT="${AGENT_GUIDANCE_TIMEOUT:-20}"
 AGENT_DEFER_WARN_HOURS="${AGENT_DEFER_WARN_HOURS:-24}"
 AGENT_DEFER_MAX_HOURS="${AGENT_DEFER_MAX_HOURS:-48}"
+AGENT_MANAGED_UNITS="${AGENT_MANAGED_UNITS:-agent-fsd.service:$HOME/.local/bin/agent-bus-fsd.sh}"
 
 VERSIONS_DIR="$HOME/.local/share/claude/versions"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent"
@@ -316,6 +326,96 @@ guidance_drift() {
     fi
 }
 
+# --- daemon drift ----------------------------------------------------------
+#
+# The harness is not the only thing on a box that runs from a file and then keeps
+# its inode. agent-fsd.service executes ~/.local/bin/agent-bus-fsd.sh; chezmoi
+# replaces that file by rename, so the running daemon holds the old file
+# descriptor and serves the old code indefinitely. Nothing restarted it.
+#
+# Measured 2026-09-04, and this is why the check exists: the fsd git panel
+# (fs.git/fs.gitdiff, FSD_VERSION 3) reached origin/main on 2026-09-03, and 15h
+# later two of the three live boxes still answered fs.ping with version 2 and no
+# "git" in their ops, so the web UI correctly hid the feature on both. The one
+# box serving it was the one where the author had restarted the unit by hand --
+# which was also the box the feature was declared "live" from. A capability can
+# be absent fleet-wide while every daemon answers happily at the old version;
+# nothing about the old daemon looks broken, so nothing surfaces it.
+#
+# Staleness is ASKED, not tracked: is the script on disk newer than the process
+# executing it? /proc/<pid> carries the process start time as its own mtime
+# (checked against `ps -o lstart=`, and stable across reads), so `test -nt`
+# answers it directly -- no state file to persist, nothing to fall out of step,
+# and a restart done by hand updates the answer for free. That last property is
+# not incidental: hand restarts are how the first boxes get fixed, and a marker
+# file would have re-restarted every one of them.
+#
+# The comparison is at one-second grain, because that is procfs's grain. An apply
+# landing in the same second as a restart can therefore read as "not newer"; the
+# process is then running the new code anyway in every ordering except a write
+# that lands microseconds after the exec, which the next apply corrects.
+#
+# Units are declared as unit:script pairs so the next daemon costs no new code.
+# agent-claude.service is deliberately absent: harness drift has its own
+# comparison and its own idle gate below, and two mechanisms restarting one unit
+# on different criteria would fight each other.
+daemon_drift() {
+    for _pair in $AGENT_MANAGED_UNITS; do
+        _unit=${_pair%%:*}
+        _script=${_pair#*:}
+        if [ -z "$_unit" ] || [ -z "$_script" ] || [ "$_script" = "$_pair" ]; then
+            log "daemon: '$_pair' is not a unit:script pair -- skipping"
+            continue
+        fi
+
+        # Not installed is the ordinary case -- plenty of boxes run no daemon --
+        # so it stays silent, the same way an absent chezmoi source does.
+        _load=$(systemctl --user show "$_unit" -p LoadState --value 2>/dev/null || true)
+        [ "$_load" = loaded ] || continue
+
+        _active=$(systemctl --user show "$_unit" -p ActiveState --value 2>/dev/null || true)
+        if [ "$_active" != active ]; then
+            log "daemon: $_unit is $_active, not active -- leaving it alone"
+            continue
+        fi
+
+        # Loaded and running but its script is gone is NOT ordinary: it means the
+        # unit and this list disagree about where the code lives, and a silent
+        # skip there would look exactly like a box that is up to date.
+        if [ ! -f "$_script" ]; then
+            log "daemon: $_unit is active but $_script does not exist -- cannot compare"
+            continue
+        fi
+
+        _pid=$(systemctl --user show "$_unit" -p MainPID --value 2>/dev/null || true)
+        case "$_pid" in
+            '' | 0 | *[!0-9]*)
+                log "daemon: $_unit is active but MainPID is '$_pid' -- refusing to guess"
+                continue ;;
+        esac
+        if [ ! -d "/proc/$_pid" ]; then
+            log "daemon: $_unit MainPID $_pid has no /proc entry -- refusing to guess"
+            continue
+        fi
+
+        [ "$_script" -nt "/proc/$_pid" ] || continue
+
+        if [ "$AGENT_UPDATE_MODE" != auto ]; then
+            log "daemon: $_unit runs code older than $_script -- AGENT_UPDATE_MODE=$AGENT_UPDATE_MODE, reporting only"
+            continue
+        fi
+
+        # No idle gate here, unlike the harness. agent-fsd.service is split from
+        # agent-claude.service precisely so it "can be restarted after a config
+        # change without disturbing a working session" (its own comment): it
+        # holds no conversation and no context, and an in-flight fs request is
+        # reissued by the caller. The cost of restarting is one dropped request;
+        # the cost of not restarting is a capability the fleet silently lacks.
+        log "daemon: $_unit is running code older than $_script -- restarting"
+        systemctl --user restart "$_unit" || log "daemon: restart of $_unit FAILED"
+    done
+}
+
 # --- pruning ---------------------------------------------------------------
 # Keep the newest AGENT_KEEP_VERSIONS builds, and never drop the one in use or
 # the one the symlink points at, whatever their age.
@@ -349,6 +449,12 @@ main() {
             log "claude update failed; continuing with what is on disk"
         date +%s > "$FETCH_STAMP"
     fi
+
+    # Before the harness lookup, and deliberately so: a daemon's staleness has
+    # nothing to do with whether an agent happens to be running on this box, and
+    # the early return below would otherwise skip the check entirely on any box
+    # whose claude is stopped -- which is exactly when a restart is safest.
+    daemon_drift
 
     pid=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1 || true)
     if [ -z "$pid" ]; then

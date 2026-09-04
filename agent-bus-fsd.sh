@@ -19,7 +19,7 @@
 
 set -e
 
-FSD_VERSION=5
+FSD_VERSION=6
 
 # A literal tab and newline, for splitting and for rejecting filenames that
 # would corrupt the TSV the listing pass parses.
@@ -92,7 +92,7 @@ disturb an agent working in the same checkout.
 The base defaults to a REMOTE-tracking ref, resolved per repo; git_base_ref()
 carries the measurements for why a local head was the wrong choice on a box
 whose agent never checks out main. Every reply carries the base it used and
-"baseage", seconds since that repo last fetched -- the panel for one repo and
+"baseage", seconds since that base could last have moved -- the panel for one repo and
 (since v5) each row of the repo menu alike, because a menu row is a bare count
 and a bare count is the one number on screen you cannot check. A base nobody
 has refreshed is then shown as stale rather than quietly inflating the diff.
@@ -1078,8 +1078,8 @@ git_base_wanted() {
     else printf 'origin/HEAD, origin/main, origin/master, main or master\n'; fi
 }
 
-# git_base_age <repodir> <baseref> -- seconds since this repo last fetched, or
-# empty when that cannot be told.
+# git_base_age <repodir> <baseref> -- seconds since the base ref could last have
+# MOVED (by a fetch or a push), or empty when that cannot be told.
 #
 # The number exists because the fix above does not make the base fresh, it makes
 # it FETCHABLE -- and a base nobody has fetched for a week is the same silent
@@ -1090,9 +1090,27 @@ git_base_age() {
     case "$2" in origin/*) ;; *) return 0 ;; esac
     _gd=$(git -C "$1" rev-parse --git-dir 2>/dev/null) || return 0
     case "$_gd" in /*) ;; *) _gd="$1/$_gd" ;; esac
-    [ -f "$_gd/FETCH_HEAD" ] || return 0
-    _mt=$(date -r "$_gd/FETCH_HEAD" +%s 2>/dev/null) || return 0
-    case "$_mt" in '' | *[!0-9]*) return 0 ;; esac
+    # FETCH_HEAD is written by fetch and pull -- but NOT by push, which also
+    # advances origin/<branch>. Measured on this box minutes after a push:
+    # origin/main equalled local main while FETCH_HEAD still read 0.7 days,
+    # so a repo whose base was exactly current reported as going stale. That
+    # is the wrong direction of wrong for a marker whose whole value is being
+    # rare: crying wolf on the repos an agent pushes to most is how it gets
+    # ignored. So take whichever of the two is NEWER.
+    _mt=""
+    for _f in "$_gd/FETCH_HEAD" "$_gd/refs/remotes/$2"; do
+        [ -f "$_f" ] || continue
+        _t=$(date -r "$_f" +%s 2>/dev/null) || continue
+        case "$_t" in '' | *[!0-9]*) continue ;; esac
+        if [ -z "$_mt" ] || [ "$_t" -gt "$_mt" ]; then _mt="$_t"; fi
+    done
+    # BLIND SPOT, stated rather than buried: once a ref is packed there is no
+    # loose file and this falls back to FETCH_HEAD alone, so a packed repo can
+    # still overstate its age after a push. packed-refs' own mtime is NOT used
+    # to patch that -- packing happens some time after the ref moved, so it
+    # would make a base look FRESHER than it is, and under-reporting staleness
+    # is the failure this whole field exists to prevent. Overstating is safe.
+    [ -n "$_mt" ] || return 0
     printf '%s\n' "$(( $(date +%s) - _mt ))"
 }
 

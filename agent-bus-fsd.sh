@@ -19,7 +19,7 @@
 
 set -e
 
-FSD_VERSION=3
+FSD_VERSION=4
 
 # A literal tab and newline, for splitting and for rejecting filenames that
 # would corrupt the TSV the listing pass parses.
@@ -53,7 +53,9 @@ Environment:
   AGENT_BUS_FS_MAX_HITS    Search matches returned per query       (default 200)
   AGENT_BUS_FS_GREP_TIMEOUT  Seconds one search may run            (default 15)
   AGENT_BUS_FS_GIT_TIMEOUT   Seconds one git command may run       (default 10)
-  AGENT_BUS_FS_GIT_BASE    Branch the git panel compares against   (default main)
+  AGENT_BUS_FS_GIT_BASE    Ref the git panel compares against  (default: resolve
+                           per repo -- origin/HEAD, origin/main, origin/master,
+                           then local main/master)
   AGENT_BUS_FS_GITIGNORE   Withhold gitignored files and .git       (default 1)
   AGENT_BUS_FS_AGENT       Answer as this agent name     (default: from /whoami)
 
@@ -81,11 +83,17 @@ Tracked file contents are otherwise served raw, with no redaction. Anything
 committed is on the remote already; the gitignored layer is not.
 
 The git ops (fs.git, fs.gitdiff) back the web UI's branch panel: which repo a
-path is in, its branch, which files differ from AGENT_BUS_FS_GIT_BASE, and one
-file's diff. The comparison is merge-base(base, HEAD) against the working tree,
-so it shows this branch's own work -- committed and not -- and never the commits
-the base has gained since. Read-only: nothing here writes the index, so browsing
-cannot disturb an agent working in the same checkout.
+path is in, its branch, which files differ from its base, and one file's diff.
+The comparison is merge-base(base, HEAD) against the working tree, so it shows
+this branch's own work -- committed and not -- and never the commits the base
+has gained since. Read-only: nothing here writes the index, so browsing cannot
+disturb an agent working in the same checkout.
+
+The base defaults to a REMOTE-tracking ref, resolved per repo; git_base_ref()
+carries the measurements for why a local head was the wrong choice on a box
+whose agent never checks out main. Each reply also carries "baseage", seconds
+since that repo last fetched, so a base nobody has refreshed can be shown as
+stale instead of quietly inflating the diff.
 
 Search (fs.grep) uses ripgrep when a real rg binary is on PATH, otherwise
 `git grep --no-index --exclude-standard`, and plain grep only where there is no
@@ -131,7 +139,9 @@ require_env() {
     MAX_HITS="${AGENT_BUS_FS_MAX_HITS:-200}"
     GREP_TIMEOUT="${AGENT_BUS_FS_GREP_TIMEOUT:-15}"
     GIT_TIMEOUT="${AGENT_BUS_FS_GIT_TIMEOUT:-10}"
-    GIT_BASE="${AGENT_BUS_FS_GIT_BASE:-main}"
+    # Empty means "resolve per repo" -- see git_base_ref(). An explicit name here
+    # still pins the base for anyone who wants one fixed thing compared against.
+    GIT_BASE="${AGENT_BUS_FS_GIT_BASE:-}"
     GITIGNORE="${AGENT_BUS_FS_GITIGNORE:-1}"
 
     # Resolved once rather than per query: which engine is available is a
@@ -857,7 +867,7 @@ do_grep() {
 # it, but naming the ops means the next capability needs no new field.
 do_ping() {
     jq -n --arg rid "$1" --arg agent "$ME" --arg root "$ROOT" \
-        --arg engine "$(grep_engine)" --arg gitbase "$GIT_BASE" \
+        --arg engine "$(grep_engine)" --arg gitbase "${GIT_BASE:-auto}" \
         --argjson version "$FSD_VERSION" '
         {body: ($agent + " serving " + $root),
          meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
@@ -994,19 +1004,94 @@ git_branch_name() {
 
 # git_base_ref <repodir> -- the ref the comparison will actually use.
 #
-# Local heads only, never origin/*: a remote-tracking ref is as stale as the
-# last fetch, and a panel that quietly compares against a week-old idea of the
-# base is worse than one that says the base is missing. "master" is tried after
-# the configured name so a repo that predates the rename still gets a panel.
+# This used to prefer local heads and refuse origin/* outright, on the grounds
+# that a remote-tracking ref is only as fresh as the last fetch. That reasoning
+# was exactly backwards ON AN AGENT BOX, and the bug it caused was severe:
+#
+#   Agents never check out main -- it is sacrosanct -- so nothing ever
+#   fast-forwards it. Local main moves ONLY on an explicit
+#   `git fetch origin main:main`, which in practice never happens.
+#   origin/main moves as a side effect of every fetch, pull and rebase.
+#
+# So the ref chosen for being fresh was the one guaranteed to rot. Measured
+# 2026-09-04: on marvin's umbrella checkout, local main was 14 commits behind
+# origin/main, and the panel reported 65 changed files against 20 real ones --
+# every upstream commit since the branch point read as the author's work.
+# Speedy saw the same thing at 89-vs-3 and diagnosed it. A comparison against a
+# stale base does not look broken; it looks like a big branch.
+#
+# origin/* is still a LOCAL ref: resolving it makes no network call and the op
+# stays read-only. refs/remotes/origin/HEAD comes first because clone points it
+# at the remote's own default branch, so master-default repos need no special
+# case. Local heads remain last, for a repo with no remote at all -- a notes or
+# plans checkout -- where they are the only answer.
+#
+# Deliberately NOT @{upstream}: that is the branch's own remote copy, so the
+# moment a branch is pushed the panel would compare it against itself and show
+# nothing at all. (Speedy's catch.)
+#
+# Staleness is not eliminated, only moved to a ref that actually gets updated --
+# so git_base_age() reports how old it is, and the panel can say so rather than
+# rendering phantom changes with a confident face.
 git_base_ref() {
-    for _r in "$GIT_BASE" master; do
-        [ -n "$_r" ] || continue
+    # An operator who named a base gets that base, resolved as written so both
+    # "develop" and "origin/develop" work. No silent fallback: a pin that
+    # quietly compares against something else is worse than one that says the
+    # ref is missing.
+    if [ -n "$GIT_BASE" ]; then
+        if git -C "$1" rev-parse --verify --quiet "$GIT_BASE" >/dev/null 2>&1; then
+            printf '%s\n' "$GIT_BASE"
+            return 0
+        fi
+        return 1
+    fi
+
+    # origin/HEAD is a symbolic ref; --short prints what it points at, which is
+    # already in "origin/<branch>" form.
+    _oh=$(git -C "$1" symbolic-ref --short --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [ -n "$_oh" ] && git -C "$1" rev-parse --verify --quiet "refs/remotes/$_oh" >/dev/null 2>&1; then
+        printf '%s\n' "$_oh"
+        return 0
+    fi
+
+    for _r in origin/main origin/master; do
+        if git -C "$1" rev-parse --verify --quiet "refs/remotes/$_r" >/dev/null 2>&1; then
+            printf '%s\n' "$_r"
+            return 0
+        fi
+    done
+
+    for _r in main master; do
         if git -C "$1" rev-parse --verify --quiet "refs/heads/$_r" >/dev/null 2>&1; then
             printf '%s\n' "$_r"
             return 0
         fi
     done
     return 1
+}
+
+# git_base_wanted -- what git_base_ref was looking for, for an error message.
+git_base_wanted() {
+    if [ -n "$GIT_BASE" ]; then printf '%s\n' "$GIT_BASE"
+    else printf 'origin/HEAD, origin/main, origin/master, main or master\n'; fi
+}
+
+# git_base_age <repodir> <baseref> -- seconds since this repo last fetched, or
+# empty when that cannot be told.
+#
+# The number exists because the fix above does not make the base fresh, it makes
+# it FETCHABLE -- and a base nobody has fetched for a week is the same silent
+# wrongness in a new place. FETCH_HEAD's mtime is when origin/* could last have
+# moved. A local head is not reported: it does not move on fetch, so an age
+# against it would be answering a question nobody asked.
+git_base_age() {
+    case "$2" in origin/*) ;; *) return 0 ;; esac
+    _gd=$(git -C "$1" rev-parse --git-dir 2>/dev/null) || return 0
+    case "$_gd" in /*) ;; *) _gd="$1/$_gd" ;; esac
+    [ -f "$_gd/FETCH_HEAD" ] || return 0
+    _mt=$(date -r "$_gd/FETCH_HEAD" +%s 2>/dev/null) || return 0
+    case "$_mt" in '' | *[!0-9]*) return 0 ;; esac
+    printf '%s\n' "$(( $(date +%s) - _mt ))"
 }
 
 # git_changed <repodir> <mergebase> -- prints "<status>\t<path>" per changed
@@ -1043,25 +1128,30 @@ git_meta_json() {
     GIT_DETACHED="${_bi%%"$TAB"*}"
     _br="${_bi#*"$TAB"}"
     if ! _bs=$(git_base_ref "$_rdir"); then
-        jq -n --arg repo "$_rp" --arg branch "$_br" --arg want "$GIT_BASE" \
+        jq -n --arg repo "$_rp" --arg branch "$_br" --arg want "$(git_base_wanted)" \
             --argjson detached "$GIT_DETACHED" '
             {repo: $repo, branch: $branch, detached: $detached, base: null,
-             baseerr: ("no " + $want + " branch in this repo to compare against")}'
+             baseage: null,
+             baseerr: ("no " + $want + " in this repo to compare against")}'
         return 0
     fi
+    _bage=$(git_base_age "$_rdir" "$_bs")
     _mb=$(git_bounded git -C "$_rdir" merge-base "$_bs" HEAD 2>/dev/null || true)
     if [ -z "$_mb" ]; then
         # Unrelated histories, or a HEAD with no commit behind it yet.
         jq -n --arg repo "$_rp" --arg branch "$_br" --arg bs "$_bs" \
             --argjson detached "$GIT_DETACHED" '
             {repo: $repo, branch: $branch, detached: $detached, base: $bs,
+             baseage: null,
              baseerr: ($branch + " and " + $bs + " share no history")}'
         return 0
     fi
     jq -n --arg repo "$_rp" --arg branch "$_br" --arg bs "$_bs" --arg mb "$_mb" \
-        --argjson detached "$GIT_DETACHED" '
+        --arg bage "${_bage:-}" --argjson detached "$GIT_DETACHED" '
         {repo: $repo, branch: $branch, detached: $detached, base: $bs,
-         mergebase: $mb, baseerr: null}'
+         mergebase: $mb,
+         baseage: (if $bage == "" then null else ($bage | tonumber) end),
+         baseerr: null}'
 }
 
 # do_git_repos <rid> <logical> <dir> -- the reply for a directory that is in no
@@ -1152,7 +1242,8 @@ do_git() {
             | {body: ("git: " + $i.branch + " — " + $i.baseerr),
                meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
                       op: "git", path: $path, repo: $i.repo, branch: $i.branch,
-                      detached: $i.detached, base: $i.base, baseerr: $i.baseerr,
+                      detached: $i.detached, base: $i.base,
+                      baseage: $i.baseage, baseerr: $i.baseerr,
                       files: []}}' |
             publish_rsp
         return
@@ -1182,6 +1273,7 @@ do_git() {
                   op: "git", path: $path, repo: $info.repo,
                   branch: $info.branch, detached: $info.detached,
                   base: $info.base, mergebase: $info.mergebase,
+                  baseage: $info.baseage,
                   files: $all[0:$max], trunc: $trunc, skipped: $skipped}}' |
         publish_rsp
 }
@@ -1302,6 +1394,7 @@ do_gitdiff() {
            meta: {kind: "fs.rsp", rid: $rid, agent: $agent, ok: true,
                   op: "gitdiff", path: $path, repo: $i.repo, rel: $rel,
                   branch: $i.branch, base: $i.base, mergebase: $i.mergebase,
+                  baseage: $i.baseage,
                   status: (if $st == "" then null else $st end),
                   untracked: $untracked, diff: $diff, trunc: $trunc}}' |
         publish_rsp
@@ -1513,7 +1606,9 @@ case "${1:-serve}" in
     if [ -n "$RG_BIN" ] && [ "$RG_OK" != 1 ]; then
         printf '          WARNING: %s exists but failed the output-format probe\n' "$RG_BIN"
     fi
-        printf 'git     : base %s, bounded at %ss\n' "$GIT_BASE" "$GIT_TIMEOUT"
+        printf 'git     : base %s, bounded at %ss\n' \
+            "${GIT_BASE:-auto (origin/HEAD, origin/main, origin/master, main, master)}" \
+            "$GIT_TIMEOUT"
         printf 'roots   : %s allowed prefixes\n' "$(allowed_roots | wc -l | tr -d ' ')"
         if [ "$GITIGNORE" = 1 ]; then
             printf 'excluded: gitignored files and .git\n'

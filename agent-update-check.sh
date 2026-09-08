@@ -79,15 +79,26 @@ log() { echo "agent-update: $*" >&2; }
 # alternatives do not. Env-load chatter goes to /dev/null here because callers
 # parse stdout.
 #
-# AGENT_BUS_SESSION is pinned because agent-bus-cli.sh derives a session identity
-# by walking the ancestry to the owning `claude`. Under the timer there is none,
-# so it falls back to a parent PID that differs every tick -- three ticks
-# registered Marvin-10, -11 and -12 before this was caught. That matters beyond
-# tidiness: "two sessions on one identity" is the very signal this design uses to
-# detect a one-per-VM violation, and a timer minting a fresh session each day
-# would forge it. Pinned, the timer holds exactly one obviously-named slot and
-# never claims (the claim is taken by monitoring, which the timer does not do).
-AGENT_BUS_SESSION="${AGENT_BUS_SESSION:-$(hostname 2>/dev/null || echo host)-update-timer}"
+# The timer takes NO session identity at all. agent-bus-cli.sh derives one by
+# walking the ancestry to the owning `claude`; under the timer there is none, so
+# it fell back to a parent PID that differs every tick -- three ticks registered
+# Marvin-10, -11 and -12 before this was caught. Pinning a fixed name fixed the
+# churn but not the premise, and the premise is now wrong twice over. A token
+# carries ONE live session, so a pinned second name is refused outright and
+# would leave the timer unable to speak. And it needs no identity to begin with:
+# its only bus calls are a plain `inbox` listing, which the server treats as a
+# cursor-neutral read that takes no claim, and a heartbeat topic publish, which
+# carries its own host in the body. Sessionless is the legacy client path the
+# bus has always supported -- exactly what a cron job should be.
+#
+# It also un-breaks the idle gate. GET /inbox with a session key returns the
+# UNION of the agent inbox and that session's own only for the session holding
+# the claim; every other session sees its own queue and nothing else. The timer
+# never monitors, so it never held the claim, so it was reading an always-empty
+# private queue -- and inbox_clear, whose whole job is "is there un-acked mail",
+# answered yes every time. Sessionless reads the agent inbox, which is where the
+# mail actually is.
+AGENT_BUS_SESSION=none
 export AGENT_BUS_SESSION
 
 in_agent_env() {

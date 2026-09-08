@@ -13,10 +13,20 @@ Talks to an agent-bus server. Requires environment variables:
   AGENT_BUS_TOKEN   Your bearer token (identifies you as an agent)
 
 Optional:
-  AGENT_BUS_SESSION Pin this session's identity. One agent identity often runs
-                    several concurrent sessions on one token; each is addressable
-                    as <agent>-<n> (see `whoami`). Derived automatically from the
-                    session that owns this invocation, so you rarely set this.
+  AGENT_BUS_SESSION Pin this session's identity (addressable as <agent>-<n>, see
+                    `whoami`). Derived automatically from the session that owns
+                    this invocation, so you rarely set this. `none` sends no
+                    session header at all -- for a caller that is not a session
+                    (a systemd timer, say), which has no identity to claim and
+                    should not hold one.
+
+A token carries ONE live session. Presenting a new identity while another
+session of this agent is still live is refused by the bus, loudly: two apps
+answering as one agent means mail lands wherever the claim happens to be and
+nobody can tell which mind acted. A predecessor that CRASHED is cleared
+automatically (its key names a process on this box that is gone) and the request
+retried; anything else you settle yourself -- stop the other app, give it its own
+token, or `unregister <n>` if you know it is really gone.
 
 Commands:
   whoami                      Show your agent name, session, claim, permissions
@@ -43,6 +53,11 @@ Commands:
                               claim on the bare agent name, so this covers your
                               session's inbox and -- if you hold the claim --
                               your agent's.
+  unregister [n]              Retire a session handle. No argument: this one, on
+                              a clean exit (what a SessionEnd hook calls; silent
+                              and harmless off the bus). With n: another session
+                              of this same agent -- how you clear a holder the
+                              one-live-session rule refused to clear for you.
   history [agent] [limit]     Your DM history, optionally with one agent
   audit <agent> [limit]       Another agent's history (requires admin)
   put-file <path> [ctype]     Upload a file as a blob; prints {id,size,...}
@@ -210,16 +225,29 @@ proc_starttime() {
     ps -o lstart= -p "$1" 2>/dev/null | tr -cd '[:alnum:]'
 }
 
+bus_hostname() {
+    hostname 2>/dev/null || uname -n 2>/dev/null || echo host
+}
+
 # session_key -> the value sent as X-Agent-Session, empty to opt out (in which
 # case the bus treats us exactly as it did before sessions existed).
+#
+# AGENT_BUS_SESSION=none is that opt-out, and it exists because deriving an
+# identity is wrong for some callers, not merely inconvenient. Under a systemd
+# timer there is no `claude` ancestor at all, so the derivation falls back to
+# the wrapper's parent -- a different pid every tick, which minted a fresh
+# session number per run (Marvin-10, -11, -12 in three ticks, before the timer
+# was pinned to a fixed name). One live session per token now makes a pinned
+# second name a refusal rather than an untidiness, and a caller that only lists
+# and publishes needs no identity at all: no key, no session, no conflict.
 session_key() {
     if [ -n "${AGENT_BUS_SESSION:-}" ]; then
+        [ "$AGENT_BUS_SESSION" = none ] && return 0
         printf '%s\n' "$AGENT_BUS_SESSION"
         return 0
     fi
     [ -n "$SESSION_SUPERVISOR" ] || return 0
-    host=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo host)
-    printf '%s-%s-%s\n' "$host" "$SESSION_SUPERVISOR" "$(proc_starttime "$SESSION_SUPERVISOR")"
+    printf '%s-%s-%s\n' "$(bus_hostname)" "$SESSION_SUPERVISOR" "$(proc_starttime "$SESSION_SUPERVISOR")"
 }
 
 require_env() {
@@ -235,14 +263,211 @@ require_jq() {
     command -v jq >/dev/null 2>&1 || error "jq is required for this command"
 }
 
-api() {
-    method="$1"
-    path="$2"
+# --- One live session per token ------------------------------------------
+#
+# The bus refuses an unseen session key while another session of this agent is
+# still live, with 409 and the holder named. Two apps answering as one agent is
+# a fault: bare-name mail lands on whichever holds the claim, replies come back
+# from a handle the sender never wrote to, and nobody can say which mind acted.
+#
+# Only the CLIENT can tell the two causes apart, which is why the server names
+# the holder instead of deciding. A session that CRASHED leaves a registration
+# the bus cannot distinguish from a working one until its TTL runs out; its key
+# is <host>-<pid>-<starttime>, so on the same box we can simply look and see
+# that the process is gone. That is wreckage: clear it and carry on, silently,
+# because a successor after a reboot is not an event anyone needs told about.
+# Everything else -- another box, a pinned name, a pid that is genuinely
+# running -- is a second app on one token, and the whole point of the rule is
+# that this fails loudly rather than quietly becoming a second identity.
+BUS_CONFLICT_RC=9
+
+# A refusal cannot report itself from where it is found: nearly every command
+# here ends `api ... | pretty`, which exits with pretty's status, and the rest
+# read `$(api ...)` in a subshell whose exit never reaches the script. Either
+# way the loud message would go to stderr and the script would still exit 0 --
+# fine for a human, useless for a hook or a caller testing the status. So the
+# refusal is recorded in a file ($$ is the main shell's pid even inside a
+# subshell, so it lands where the main shell looks) and the EXIT trap turns it
+# into the exit status. POSIX runs an EXIT trap in the main shell alone, never
+# in a subshell, which is what makes this safe: no subshell can consume the flag
+# before the main shell sees it. Commands that HANDLE a refusal themselves clear
+# the flag; leaving it set would report their own clean exit as a failure.
+CONFLICT_FLAG="${TMPDIR:-/tmp}/agent-bus-cli-conflict.$$"
+
+# Call after deliberately swallowing a request's failure: a refusal that a
+# command has decided to absorb must not go on to become that command's exit
+# status. Only for paths that really do handle it -- clearing it elsewhere is
+# how the whole mechanism becomes decorative.
+bus_conflict_handled() {
+    rm -f "$CONFLICT_FLAG" 2>/dev/null || true
+}
+
+# Sweep the scratch files of a request in flight. Signals matter here: `wake`
+# spends nearly all its life blocked inside one long-poll and is killed
+# routinely (a /clear reaps the previous context's monitor, and the harness
+# reaps idle background shells under memory pressure), so without this every
+# such death would leave a pair behind.
+#
+# It sweeps by GLOB rather than by remembering the two paths, and that is the
+# whole trick: `api` runs inside a subshell on nearly every call (`api | pretty`
+# is a pipeline), a subshell cannot write its parent's variables, and POSIX
+# resets traps to default in one -- so the shell that holds the names can never
+# run a trap, and the shell that runs the trap can never learn the names. The
+# names therefore carry $$, which is the main shell's pid even inside a
+# subshell, and the trap matches on that.
+bus_cleanup() {
+    rm -f "${TMPDIR:-/tmp}/agent-bus-cli.$$."* 2>/dev/null || true
+}
+
+bus_exit() {
+    _bx_rc=$?
+    bus_cleanup
+    if [ -f "$CONFLICT_FLAG" ]; then
+        rm -f "$CONFLICT_FLAG"
+        [ "$_bx_rc" -eq 0 ] && _bx_rc="$BUS_CONFLICT_RC"
+    fi
+    exit "$_bx_rc"
+}
+trap bus_exit EXIT
+# Conventional 128+n, matching what the shell would have exited with anyway.
+trap 'bus_cleanup; exit 130' INT
+trap 'bus_cleanup; exit 143' TERM
+
+# API_HDR, when set, is where the response headers are dumped so the status can
+# be read without disturbing the body (which callers capture, redirect with -o,
+# or stream). Empty means "do not dump".
+API_HDR=''
+
+bus_tmpfile() {
+    mktemp "${TMPDIR:-/tmp}/agent-bus-cli.$$.XXXXXX" 2>/dev/null || error "cannot create a temp file"
+}
+
+# http_status <header-dump> -> the final status code. The last status line wins:
+# an upload large enough to trigger Expect/100-continue dumps two.
+http_status() {
+    awk '/^HTTP\// { code = $2 } END { print code }' "$1" 2>/dev/null
+}
+
+# _api_raw <method> <path> [curl args...] -- the request itself, no conflict
+# handling. Separate from api() so the retry can re-issue the identical call.
+_api_raw() {
+    _r_method="$1"
+    _r_path="$2"
     shift 2
     if [ -n "$SESSION_KEY" ]; then
         set -- -H "X-Agent-Session: ${SESSION_KEY}" "$@"
     fi
-    curl -sS -X "$method" -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" "$@" "${AGENT_BUS_URL}${path}"
+    if [ -n "$API_HDR" ]; then
+        set -- -D "$API_HDR" "$@"
+    fi
+    curl -sS -X "$_r_method" -H "Authorization: Bearer ${AGENT_BUS_TOKEN}" "$@" "${AGENT_BUS_URL}${_r_path}"
+}
+
+# session_key_is_corpse <key> -> 0 when <key> names a process on THIS box that
+# is gone. Keys are <host>-<pid>-<starttime> and a hostname may itself contain
+# hyphens, so the fields are taken from the RIGHT. Anything of another shape is
+# not ours to judge. Deliberately conservative in one direction: a pid we can
+# see but cannot read a start time for counts as alive, because the cost of
+# being wrong here is evicting a working session, not waiting out a TTL.
+session_key_is_corpse() {
+    [ -n "$1" ] || return 1
+    _ck_start="${1##*-}"
+    _ck_rest="${1%-*}"
+    [ "$_ck_rest" != "$1" ] || return 1
+    _ck_pid="${_ck_rest##*-}"
+    _ck_host="${_ck_rest%-*}"
+    [ "$_ck_host" != "$_ck_rest" ] || return 1
+    [ -n "$_ck_host" ] || return 1
+    case "$_ck_pid" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$_ck_host" = "$(bus_hostname)" ] || return 1
+    ps -p "$_ck_pid" >/dev/null 2>&1 || return 0
+    # Alive -- but pids are recycled, and a recycled one is still a corpse.
+    _ck_now=$(proc_starttime "$_ck_pid")
+    [ -n "$_ck_now" ] || return 1
+    [ "$_ck_now" != "$_ck_start" ]
+}
+
+# evict_session <n> -> retire session <n> of this agent. Sent WITHOUT a session
+# header on purpose: the caller here is the session being refused, so presenting
+# our own key would have the conflict block the very call that clears it.
+evict_session() {
+    _ev_key="$SESSION_KEY"
+    _ev_hdr="$API_HDR"
+    SESSION_KEY=''
+    API_HDR=''
+    # 204 and an empty body on success; any body is the server's error JSON.
+    _ev_out=$(_api_raw DELETE "/sessions/$1" 2>/dev/null) || _ev_out='request failed'
+    SESSION_KEY="$_ev_key"
+    API_HDR="$_ev_hdr"
+    [ -z "$_ev_out" ]
+}
+
+# session_conflict <body-file> -> 0 when the holder was a corpse and has been
+# cleared (retry), 1 after reporting a live holder loudly.
+session_conflict() {
+    _sc_name=''
+    _sc_key=''
+    _sc_seen=''
+    _sc_exp=''
+    if command -v jq >/dev/null 2>&1; then
+        _sc_name=$(jq -r '.holder.name // empty' <"$1" 2>/dev/null) || _sc_name=''
+        _sc_key=$(jq -r '.holder.key // empty' <"$1" 2>/dev/null) || _sc_key=''
+        _sc_seen=$(jq -r '.holder.last_seen // empty' <"$1" 2>/dev/null) || _sc_seen=''
+        _sc_exp=$(jq -r '.holder.expires_at // empty' <"$1" 2>/dev/null) || _sc_exp=''
+    fi
+    _sc_n="${_sc_name##*-}"
+    case "$_sc_n" in '' | *[!0-9]*) _sc_n='' ;; esac
+    if [ -n "$_sc_n" ] && session_key_is_corpse "$_sc_key" && evict_session "$_sc_n"; then
+        return 0
+    fi
+    : >"$CONFLICT_FLAG" 2>/dev/null || true
+    {
+        printf 'Error: the bus refused this session: another session of this agent is live.\n'
+        printf '  holder:    %s (key %s)\n' "${_sc_name:-unknown}" "${_sc_key:-unknown}"
+        printf '  last seen: %s\n' "${_sc_seen:-unknown}"
+        printf '  blocks until it is retired, or until %s\n' "${_sc_exp:-its TTL expires}"
+        printf 'One live session per token. Two apps answering as one agent means mail lands\n'
+        printf 'wherever the claim happens to be and nobody can tell which mind acted -- so if\n'
+        printf 'that session is genuinely running, stop it or give this one its own token.\n'
+        printf 'It was not cleared automatically because it is not provably dead wreckage on\n'
+        printf 'this box. If you know it is gone, retire it deliberately:\n'
+        printf '  agent-bus-cli.sh unregister %s\n' "${_sc_n:-<n>}"
+    } >&2
+    return 1
+}
+
+# api <method> <path> [curl args...] -- one authenticated request, with the
+# one-live-session rule handled. Exits $BUS_CONFLICT_RC when refused by a holder
+# we must not evict, so a caller that silences stderr (the wake loop, the
+# heartbeat) can still tell a conflict from a transient failure.
+api() {
+    # A request with no session key cannot be refused by the rule, so it streams
+    # straight through -- no buffering, which matters for blob downloads.
+    if [ -z "$SESSION_KEY" ]; then
+        _api_raw "$@"
+        return $?
+    fi
+    API_HDR=$(bus_tmpfile)
+    _api_body=$(bus_tmpfile)
+    _api_rc=0
+    # The body is buffered rather than streamed because a retried request must
+    # not emit the 409 JSON ahead of the real answer.
+    _api_raw "$@" >"$_api_body" || _api_rc=$?
+    if [ "$(http_status "$API_HDR")" = "409" ]; then
+        if session_conflict "$_api_body"; then
+            : >"$_api_body"
+            _api_rc=0
+            _api_raw "$@" >"$_api_body" || _api_rc=$?
+        else
+            rm -f "$API_HDR" "$_api_body"
+            API_HDR=''
+            return "$BUS_CONFLICT_RC"
+        fi
+    fi
+    cat "$_api_body"
+    rm -f "$API_HDR" "$_api_body"
+    API_HDR=''
+    return "$_api_rc"
 }
 
 pretty() {
@@ -422,6 +647,15 @@ emit_heartbeat() {
     else
         HEARTBEAT_POSTED=failed
     fi
+    # This function is contractually silent -- it runs at session start and must
+    # never break one -- so it swallows stderr, which means a refusal here would
+    # otherwise exit the whole session-start hook 9 with nothing said. Own it:
+    # name it in HEARTBEAT_POSTED for callers that want to speak, and clear the
+    # flag so a handled refusal is not reported twice.
+    if [ -f "$CONFLICT_FLAG" ]; then
+        bus_conflict_handled
+        HEARTBEAT_POSTED=refused
+    fi
     return 0
 }
 
@@ -513,6 +747,13 @@ case "$cmd" in
         printf '\n%s\n' 'KNOWN MONITOR DEATHS - expected, not faults; re-arm silently, once per death, with no commentary, no counting and no memory diagnostics. (1) Output file exactly `[killed]` with a notice that the system is low on memory: the harness registers a machine-wide PSI trigger (150 ms stall per 2 s window) and every idle background shell reaps itself when it fires and no human has touched this session for 30 minutes. It is not a memory shortage - oom_kill and cgroup memory.events are zero on both boxes checked - and no mail is lost, because un-acked mail is re-delivered. (2) `Terminated` / exit 143 immediately after a /clear: this briefing retired the previous context'"'"'s monitor on purpose so two wakes do not race. Both are closed investigations: `agent-bus-cli.sh search "pressure reap"` has the analysis.'
         # Absence of this post is the fleet-visible signal; see emit_heartbeat.
         emit_heartbeat
+        # One sentence, and only when the bus actually refused us -- which the
+        # heartbeat has just found out for free. A session that cannot register
+        # will have a monitor that never monitors, and discovering that from the
+        # silence is exactly what this repo keeps paying for.
+        if [ "$HEARTBEAT_POSTED" = refused ]; then
+            printf '\n%s\n' 'BUS: this session is REFUSED -- another session of this agent is already live, and a token carries one. Do not work around it: run `agent-bus-cli.sh whoami` to see the holder. Either that session is the real one (leave the bus to it; do not arm a monitor) or it is wreckage the message tells you how to retire.'
+        fi
         ;;
     heartbeat)
         # Manual/diagnostic entry point. --force bypasses the rate limit so a box
@@ -593,9 +834,27 @@ case "$cmd" in
                 # now rather than when the server's TTL expires. Best-effort:
                 # the TTL is the real mechanism, this is only promptness.
                 api DELETE /sessions/me >/dev/null 2>&1 || true
+                bus_conflict_handled
                 exit 0
             fi
             resp=$(api GET "/inbox?wait=${wait}" 2>/dev/null) || {
+                rc=$?
+                if [ "$rc" -eq "$BUS_CONFLICT_RC" ]; then
+                    # Refused: another session of this agent is live and is not
+                    # wreckage we may clear, so this session must not monitor.
+                    # Say why and exit -- a monitor that dies quietly is the
+                    # failure shape that keeps costing this fleet whole days.
+                    # The diagnostic is re-issued through one cheap request with
+                    # stderr free, since the long-poll silences it.
+                    api GET /whoami >/dev/null || true
+                    printf 'wake: refused by the one-live-session rule; this session is not monitoring.\n' >&2
+                    # Damped, because exiting is precisely what makes the harness
+                    # re-invoke the agent -- whose Stop hook then arms a fresh
+                    # wake. Un-damped, a permanently refused monitor would burn a
+                    # turn a second; a minute apart it stays a nuisance.
+                    sleep 60
+                    exit "$BUS_CONFLICT_RC"
+                fi
                 sleep 2
                 continue
             }
@@ -609,6 +868,47 @@ case "$cmd" in
             fi
             exit 0
         done
+        ;;
+    unregister)
+        # Retire a session handle. Two forms, and the difference is whose.
+        #
+        # No argument: this session, on the way out. Meant for a Claude Code
+        # SessionEnd hook -- with one live session per token, a session that
+        # simply vanishes blocks its own successor until the server's TTL
+        # expires, so unregistering is no longer mere tidiness. Self-gating on
+        # the token exactly like `onboard`, so the hook line is unconditional:
+        #     {"SessionEnd":[{"matcher":"","hooks":[{"type":"command",
+        #       "command":"agent-bus-cli.sh unregister 2>/dev/null || true"}]}]}
+        #
+        # With <n>: another session of this same agent, deliberately -- the
+        # escape hatch the refusal message names when a holder cannot be proved
+        # dead automatically. Sent with no session header, so the rule cannot
+        # block the call that clears it.
+        [ -n "${AGENT_BUS_TOKEN:-}" ] || exit 0
+        require_env
+        if [ -n "${1:-}" ]; then
+            case "$1" in *[!0-9]*) error "Usage: agent-bus-cli.sh unregister [session-number]" ;; esac
+            SESSION_KEY=''
+            out=$(api DELETE "/sessions/$1") || exit 1
+            # 204 with an empty body is success; any body is an error. Printed
+            # raw rather than through `pretty`, because a server that does not
+            # know this route at all answers with the mux's plain-text 404 and
+            # feeding that to jq turns a clear message into a parse error.
+            [ -z "$out" ] || {
+                printf '%s\n' "$out" >&2
+                exit 1
+            }
+            printf 'unregistered session %s\n' "$1"
+        else
+            # Silent by design: this is a hook, and a session that never spoke to
+            # the bus has nothing to retire.
+            [ -n "$SESSION_KEY" ] || exit 0
+            api DELETE /sessions/me >/dev/null 2>&1 || true
+            # A refusal here means we were never registered, so there was nothing
+            # to retire: absorbed on purpose, and a hook must not exit non-zero
+            # for it.
+            bus_conflict_handled
+        fi
         ;;
     history)
         require_env

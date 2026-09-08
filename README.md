@@ -38,7 +38,31 @@ agent-bus-cli.sh inbox 120          # long-poll up to 120s
 agent-bus-cli.sh ack <message-id>
 agent-bus-cli.sh pub build-status "green"
 agent-bus-cli.sh watch build-status
+agent-bus-cli.sh unregister         # retire this session's handle on exit
 ```
+
+**One live session per token.** Each session identifies itself to the bus (as
+`<agent>-<n>`, derived from host + the owning `claude` process, see `whoami`),
+and the bus refuses a second one on the same token — two apps answering as one
+agent means mail lands wherever the claim happens to be and nobody can tell
+which mind acted. A predecessor that *crashed* is cleared automatically and the
+request retried, since its key names a process on this box that is demonstrably
+gone; anything else is a loud error naming the holder and the exact
+`agent-bus-cli.sh unregister <n>` that would retire it. Set
+`AGENT_BUS_SESSION=none` for a caller that is not a session at all (a systemd
+timer, say) — it sends no session header and takes no slot.
+
+Have each box retire its session on exit, or it blocks its own successor until
+the server's 15-minute TTL expires. `~/.claude/settings.json` is hand-rolled per
+box, so add it there by hand:
+
+```json
+{"SessionEnd":[{"matcher":"","hooks":[{"type":"command",
+  "command":"agent-bus-cli.sh unregister 2>/dev/null || true"}]}]}
+```
+
+The command self-gates on `AGENT_BUS_TOKEN`, so the same line is harmless on a
+box that is not on the bus.
 
 ### `agent-bus-fsd.sh`
 

@@ -439,10 +439,11 @@ session_conflict() {
 # api <method> <path> [curl args...] -- one authenticated request, with the
 # one-live-session rule handled. Exits $BUS_CONFLICT_RC when refused by a holder
 # we must not evict, so a caller that silences stderr (the wake loop, the
-# heartbeat) can still tell a conflict from a transient failure.
+# heartbeat) can still tell a conflict from a transient failure. The body must
+# stay on stdout -- never pass curl -o -- because the 409 is read from it.
 api() {
     # A request with no session key cannot be refused by the rule, so it streams
-    # straight through -- no buffering, which matters for blob downloads.
+    # straight through -- no buffering.
     if [ -z "$SESSION_KEY" ]; then
         _api_raw "$@"
         return $?
@@ -516,6 +517,14 @@ HEARTBEAT_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent/heartbeat-last"
 # fingerprint <path> -> 12 hex of its SHA-256, or a word saying why not.
 # Content-addressed rather than a hand-bumped constant: this repo has already
 # demonstrated what happens to a convention that depends on remembering.
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+    fi
+}
+
 fingerprint() {
     [ -r "$1" ] || { printf 'absent'; return 0; }
     if command -v sha256sum >/dev/null 2>&1; then
@@ -950,14 +959,35 @@ case "$cmd" in
         api POST /blobs -H "Content-Type: ${2:-application/octet-stream}" --data-binary "@$1" | pretty
         ;;
     get-file)
-        # Download a blob by id. Streams to stdout, or to a file if given (the
-        # ?name= makes the server suggest that filename, harmless for -o).
+        # Download a blob by id, to stdout or to a file if given (the ?name= makes
+        # the server suggest that filename, harmless here).
+        # Spooled and verified before anything is written out. curl exits 0 on an
+        # HTTP error, so a missing blob used to be "saved" as its 25-byte JSON
+        # error body -- over any file already at that path -- and exit 0.
         require_env
         [ -n "${1:-}" ] || error "Usage: agent-bus-cli.sh get-file <id> [output-path]"
+        gf_path="/blobs/$1"
+        [ -z "${2:-}" ] || gf_path="$gf_path?name=$(basename "$2")"
+        gf_tmp=$(bus_tmpfile)
+        gf_rc=0
+        # Via stdout, never curl -o: api reads a 409 from the body it captures, and
+        # with -o that body went to the file instead, so a crashed predecessor was
+        # reported as a live holder and never cleared.
+        api GET "$gf_path" >"$gf_tmp" || gf_rc=$?
+        [ "$gf_rc" -eq 0 ] || exit "$gf_rc"
+        # The id is the sha256 of the bytes, so the bytes are their own proof:
+        # anything else is an error body, a proxy page or a truncated transfer.
+        gf_sum=$(sha256_file "$gf_tmp")
+        [ -n "$gf_sum" ] || error "get-file needs sha256sum or shasum to verify the download"
+        if [ "$gf_sum" != "$1" ]; then
+            gf_msg=$(jq -r '.error // empty' <"$gf_tmp" 2>/dev/null) || gf_msg=''
+            [ -n "$gf_msg" ] || gf_msg=$(head -c 200 "$gf_tmp" | tr -s '\n' ' ')
+            error "get-file $1: ${gf_msg:-reply does not match the id}"
+        fi
         if [ -n "${2:-}" ]; then
-            api GET "/blobs/$1?name=$(basename "$2")" -o "$2" && printf 'saved %s\n' "$2"
+            cat "$gf_tmp" >"$2" && printf 'saved %s\n' "$2"
         else
-            api GET "/blobs/$1"
+            cat "$gf_tmp"
         fi
         ;;
     send-file)

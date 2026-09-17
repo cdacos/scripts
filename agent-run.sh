@@ -55,7 +55,7 @@ AGENT_RESUME="${AGENT_RESUME:-1}"
 # on a cold start, because --continue silently does the latter when there is
 # nothing to continue and the script cannot tell the two apart without
 # reimplementing the harness's transcript-path mangling.
-AGENT_START_PROMPT="${AGENT_START_PROMPT:-Supervisor start: systemd launched this session, not a human. If this is a resumed conversation, your previous turn was cut off mid-flight by a harness update -- that interruption is expected, not a fault, and any in-flight tool call is gone. Arm your agent-bus monitor now (agent-bus-cli.sh wake as a background task), handle any un-acked mail, then go idle. Acknowledge in one line.}"
+AGENT_START_PROMPT="${AGENT_START_PROMPT:-Supervisor start: systemd launched this session, not a human. If this is a resumed conversation, your previous turn was cut off mid-flight by a harness update -- that interruption is expected, not a fault, and any in-flight tool call is gone. Arm your agent-bus monitor now (agent-bus-cli.sh wake with Bash run_in_background, not the Monitor tool), handle any un-acked mail, then go idle. Acknowledge in one line.}"
 
 # --- one per VM ------------------------------------------------------------
 # A non-templated unit is already single-instance; this catches the other case,

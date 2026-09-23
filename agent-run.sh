@@ -42,7 +42,27 @@
 #   AGENT_CLAUDE_ARGS   flag list, word-split                  (default: below)
 #   AGENT_START_PROMPT  the opening turn
 #   AGENT_RESUME        1 = --continue the previous conversation (default 1)
+#   AGENT_UNIT          the systemd --user unit running this   (default: agent-claude.service)
+#
+# The opening turn also carries a few launch facts -- Claude Code version (and
+# the one the previous start ran), a start counter, systemd's auto-restart
+# count, and the working directory as a link into the bus Files tab. They are
+# computed here, not by the agent, so the operator reading the prompt over
+# Remote Control sees them without spending a turn. The counter and previous
+# version live in $XDG_STATE_HOME/agent/run-starts.
 set -eu
+
+# Load the agent's environment FIRST (agent-env.sh; see 2. above), by re-running
+# this script once under it: the launch facts need AGENT_BUS_URL and
+# AGENT_BUS_FS_ROOT, which only that environment has. Only exported variables
+# survive, which is all claude ever received anyway.
+if [ -z "${AGENT_RUN_ENV_LOADED:-}" ]; then
+    AGENT_RUN_ENV_LOADED=1
+    export AGENT_RUN_ENV_LOADED
+    exec /bin/bash -lc '. "$1" || exit 1; shift; exec "$@"' \
+        agent-run "$HOME/.local/bin/agent-env.sh" /bin/sh "$0" "$@"
+fi
+unset AGENT_RUN_ENV_LOADED
 
 conf="${XDG_CONFIG_HOME:-$HOME/.config}/agent/run.conf"
 [ -r "$conf" ] && . "$conf"
@@ -51,6 +71,7 @@ AGENT_NAME="${AGENT_NAME:-$(id -un)}"
 AGENT_WORKDIR="${AGENT_WORKDIR:-$HOME/src}"
 AGENT_CLAUDE_ARGS="${AGENT_CLAUDE_ARGS:---dangerously-skip-permissions --thinking-display summarized}"
 AGENT_RESUME="${AGENT_RESUME:-1}"
+AGENT_UNIT="${AGENT_UNIT:-agent-claude.service}"
 # One prompt for both paths. It has to read correctly on a resumed session AND
 # on a cold start, because --continue silently does the latter when there is
 # nothing to continue and the script cannot tell the two apart without
@@ -69,18 +90,79 @@ fi
 
 cd "$AGENT_WORKDIR" 2>/dev/null || cd "$HOME"
 
+# --- launch facts ------------------------------------------------------------
+# Every probe is best-effort: a missing fact is left out, never fatal. A start
+# must not fail because of a status line.
+launch_facts() {
+    _version=$(claude --version 2>/dev/null | awk 'NR == 1 { print $1 }') || _version=
+    _state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/agent"
+    _state="$_state_dir/run-starts"
+    # One line: <count> <version at that start> <date tracking began>
+    _count=0 _prev= _since=
+    [ -r "$_state" ] && read -r _count _prev _since <"$_state" 2>/dev/null || true
+    case "$_count" in '' | *[!0-9]*) _count=0 ;; esac
+    _count=$((_count + 1))
+    [ -n "$_since" ] || _since=$(date -u +%Y-%m-%d)
+    if mkdir -p "$_state_dir" 2>/dev/null &&
+        printf '%s %s %s\n' "$_count" "${_version:-${_prev:--}}" "$_since" >"$_state.tmp" 2>/dev/null; then
+        mv -f "$_state.tmp" "$_state" 2>/dev/null || true
+    fi
+    [ "$_prev" = - ] && _prev=
+
+    printf 'Launch facts (computed by agent-run.sh, not the agent):\n'
+    if [ -n "$_version" ]; then
+        if [ -z "$_prev" ]; then
+            printf -- '- Claude Code %s (previous start: unknown)\n' "$_version"
+        elif [ "$_prev" = "$_version" ]; then
+            printf -- '- Claude Code %s (unchanged since the previous start)\n' "$_version"
+        else
+            printf -- '- Claude Code %s (previous start ran %s)\n' "$_version" "$_prev"
+        fi
+    fi
+    _nr=$(systemctl --user show "$AGENT_UNIT" -p NRestarts --value 2>/dev/null) || _nr=
+    case "$_nr" in
+        '' | *[!0-9]*) printf -- '- Start #%s since %s\n' "$_count" "$_since" ;;
+        *) printf -- '- Start #%s since %s; systemd auto-restarts since the last deliberate start: %s\n' "$_count" "$_since" "$_nr" ;;
+    esac
+
+    # The Files tab serves AGENT_BUS_FS_ROOT (default ~/src), addressed as
+    # #files/<agent>/<path relative to it>/ -- same default as agent-bus-fsd.sh.
+    _cwd=$(pwd -P)
+    _root=$(cd "${AGENT_BUS_FS_ROOT:-$HOME/src}" 2>/dev/null && pwd -P) || _root=
+    _rel=
+    case "$_cwd/" in
+        "$_root"/*) _rel=${_cwd#"$_root"} _rel=${_rel#/} ;;
+        *) _root= ;;
+    esac
+    if [ -n "$_root" ] && [ -n "${AGENT_BUS_URL:-}" ]; then
+        _link="${AGENT_BUS_URL%/}/ui#files/$AGENT_NAME/${_rel:+$_rel/}"
+        _link=$(printf '%s' "$_link" | sed 's/ /%20/g')
+        printf -- '- Working directory: [%s](%s)\n' "$_cwd" "$_link"
+    else
+        printf -- '- Working directory: %s\n' "$_cwd"
+    fi
+}
+facts=$(launch_facts 2>/dev/null) || facts=
+
 # Word splitting on AGENT_CLAUDE_ARGS is deliberate: it is a flag list.
 # shellcheck disable=SC2086
 set -- claude $AGENT_CLAUDE_ARGS --remote-control "$AGENT_NAME"
 if [ "$AGENT_RESUME" = 1 ]; then
     set -- "$@" --continue
 fi
-set -- "$@" "$AGENT_START_PROMPT"
+# Appended rather than templated into the default, so a run.conf that replaces
+# AGENT_START_PROMPT still gets the facts.
+if [ -n "$facts" ]; then
+    set -- "$@" "$AGENT_START_PROMPT
+
+$facts"
+else
+    set -- "$@" "$AGENT_START_PROMPT"
+fi
 
 if [ "$AGENT_RESUME" = 1 ]; then
     echo "agent-run: starting agent '$AGENT_NAME' in $(pwd) (resuming previous conversation)" >&2
 else
     echo "agent-run: starting agent '$AGENT_NAME' in $(pwd) (fresh session, AGENT_RESUME=$AGENT_RESUME)" >&2
 fi
-exec /bin/bash -lc '. "$1" || exit 1; shift; exec "$@"' \
-    agent-run "$HOME/.local/bin/agent-env.sh" "$@"
+exec "$@"

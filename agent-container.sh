@@ -1,4 +1,7 @@
 #!/bin/sh
+# DEPRECATED - agents now run in their own VMs (agent-supervision-install.sh / agent-run.sh).
+# Kept working for existing containers; do not extend it.
+#
 # agent! - Folder-based Docker container launcher for AI agents
 #
 # Each named container mounts its accumulated set of saved folders (rw, zero or more)
@@ -10,7 +13,7 @@
 
 set -e
 
-# Bump this on user-visible behavior changes (see CLAUDE.md).
+# Bump this on user-visible behavior changes.
 VERSION="1.3"
 
 # State home: per-name container state lives here. Override for testing.
@@ -1665,6 +1668,7 @@ EOF
 
 # Main entry point
 main() {
+	[ "${1:-}" = completion ] || echo 'agent-container.sh is DEPRECATED: agents now run in their own VMs.' >&2
 	if [ $# -eq 0 ]; then
 		cmd_list
 		exit 0

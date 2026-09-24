@@ -4,7 +4,9 @@ Shared developer utility scripts.
 
 ## Scripts
 
-### `agent-container.sh` (aka `agent`)
+### `agent-container.sh` (aka `agent`) — DEPRECATED
+
+> **Deprecated.** Agents now run in their own VMs (see *Agent supervision* below). The script still works for existing containers but is no longer developed.
 
 Folder-based Docker agent container launcher. `agent! <name> [folder]` starts a named container that mounts its accumulated set of saved folders (rw) plus its own persistent state under `~/.local/agent-container/<name>/` (bus token, Claude home, port) — nothing else on the host. The folder argument is **optional**: omit it to map no folder (the agent gets just its own home + any saved set — good for an agent that clones/pulls its own repos); pass `.` to map the current dir. `docker.sock` is not mounted unless you pass `--docker`.
 
@@ -19,7 +21,9 @@ agent! kill api             # Tear down 'agent-api' and delete its state
 
 Each container owns its own Dockerfile at `~/.local/agent-container/<name>/Dockerfile`, written from a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux) on first create. It's bind-mounted read-write at `~/Dockerfile`, so the container can edit its own build recipe — the change takes effect on the next `agent! <name>` recreate. The target folder's own Dockerfiles are ignored; copy from them by hand if you want.
 
-### `dev-container.sh`
+### `dev-container.sh` — DEPRECATED
+
+> **Deprecated**, for the same reason as `agent-container.sh`.
 
 The git-worktree-based `dev!`. Pairs each branch with a worktree + container under `../{repo}.worktrees/{port}/{branch}/`, mounting the whole repo. Kept for repo/worktree-centric workflows; use `agent-container.sh` (above) for the newer folder-based model.
 
@@ -177,12 +181,14 @@ always start from a clean context.
 Add to your `.chezmoiexternal.toml`:
 
 ```toml
+# DEPRECATED - agents run in their own VMs
 [".local/bin/agent-container.sh"]
     type = "file"
     url = "https://raw.githubusercontent.com/cdacos/scripts/main/agent-container.sh"
     executable = true
     refreshPeriod = "0"
 
+# DEPRECATED - agents run in their own VMs
 [".local/bin/dev-container.sh"]
     type = "file"
     url = "https://raw.githubusercontent.com/cdacos/scripts/main/dev-container.sh"
@@ -264,6 +270,7 @@ a chezmoi-delivered unit change is picked up within a day.
 ### Standalone
 
 ```sh
+# deprecated: agent-container.sh, dev-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/agent-container.sh -o ~/.local/bin/agent-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/dev-container.sh -o ~/.local/bin/dev-container.sh
 curl -fsSL https://raw.githubusercontent.com/cdacos/scripts/main/check-tools.sh -o ~/.local/bin/check-tools.sh

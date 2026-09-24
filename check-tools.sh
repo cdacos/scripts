@@ -11,6 +11,8 @@ lsd|ls deluxe|lsd|lsd|https://github.com/lsd-rs/lsd
 rg|fast grep|ripgrep|ripgrep|https://github.com/BurntSushi/ripgrep
 fd|fast find|fd-find|fd|https://github.com/sharkdp/fd|fdfind
 jq|JSON processor|jq|jq|https://jqlang.github.io/jq/
+shellcheck|shell linter|shellcheck|shellcheck|https://www.shellcheck.net
+shfmt|shell formatter|shfmt|shfmt|https://github.com/mvdan/sh
 sd|sed alternative|sd|sd|https://github.com/chmln/sd
 fzf|fuzzy finder|fzf|fzf|https://github.com/junegunn/fzf
 doggo|DNS client|-|doggo|https://doggo.mrkaran.dev

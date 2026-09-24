@@ -1,4 +1,7 @@
 #!/bin/sh
+# DEPRECATED - agents now run in their own VMs (agent-supervision-install.sh / agent-run.sh).
+# Kept working for existing containers; do not extend it.
+#
 # dev! - Git worktree + Docker dev container launcher
 
 set -e
@@ -660,6 +663,7 @@ EOF
 
 # Main entry point
 main() {
+    [ "${1:-}" = completion ] || echo 'dev-container.sh is DEPRECATED: agents now run in their own VMs.' >&2
     if [ $# -eq 0 ]; then
         cmd_list
         exit 0

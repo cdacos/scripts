@@ -1,79 +1,117 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
-## Repository purpose
+## Purpose
 
-Standalone developer utility shell scripts, distributed as single files via raw GitHub URLs (users install them with chezmoi externals or curl — see README.md). Each script must therefore remain **self-contained in one file** with no dependencies on other files in this repo. (`agent-bus-cli.sh` is the shell client for the **agent-bus** service, which now lives in its own repo at `../agent-bus`.)
+Standalone utility shell scripts, distributed as single files via raw GitHub URLs (chezmoi
+externals or curl — see README.md). **Every script must stay self-contained in one file**, with no
+dependency on any other file in this repo.
 
 ## Commands
 
-There is no test framework. Lint and format shell scripts with:
+No test framework. Lint and format with:
 
 ```sh
-shellcheck dev-container.sh dev-container-per-repo.sh check-tools.sh agent-bus-cli.sh agent-bus-monitor-guard.sh agent-bus-fsd.sh
-shfmt -d .          # diff formatting issues (shfmt -w to fix)
+shellcheck *.sh
+shfmt -d .          # shfmt -w to fix
 ```
-
-Both tools are preinstalled in the dev container (`dev-container.sh`'s embedded default image). To manually test `dev-container.sh`, run it against a scratch folder (`DEV_CONTAINER_HOME=/tmp/dc dev! test /some/folder`) — it requires Docker, auto-writes the per-container Dockerfile on first create, and prompts interactively before creating/killing anything.
 
 ## Conventions
 
-- `dev-container.sh` and `check-tools.sh` are POSIX sh (`#!/bin/sh`) — avoid bashisms (arrays, `[[ ]]`, `local` is used sparingly). Scripts in `jellyfin-media-player/` are bash.
+- Top-level scripts are POSIX sh (`#!/bin/sh`): no arrays, no `[[ ]]`. Scripts under
+  `jellyfin-media-player/` are bash.
+- **Test exit status, not output emptiness.** An erroring command leaves stdout empty, which reads
+  exactly like "nothing found".
+- **Never hand jq a payload through `--arg`/`--argjson`** — `MAX_ARG_STRLEN` caps one argv entry
+  at 128 KiB and the failure is silent. Use `--rawfile`.
+- A helper cannot report through a global when callers run it in `$(...)` — the subshell's write
+  never reaches the parent.
+- Pass tokens on stdin (`curl -K -`), not in argv, where any co-resident process can read them in
+  `ps`. `agent-bus-fsd.sh` does this; `agent-bus-cli.sh` still passes the token in argv, which is
+  a known leak and shouldn't be copied.
 
-## Architecture: dev-container.sh (`dev!`)
+## agent-bus-cli.sh
 
-The main script. `dev! <name> [folder] [--save|--only] [--keep-alive] [--docker]` launches a named Docker container that mounts an **accumulated set of folders** (rw, at their real absolute paths) plus its own persistent state — nothing else on the host, and it **suspends itself when idle** unless `--keep-alive`. No git worktrees, no repo bind-mount. (Rewritten from the old worktree/port-dir model; pre-existing worktree containers keep running but are unmanageable by this script.)
+POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). Reads
+`AGENT_BUS_URL`/`AGENT_BUS_TOKEN`. Keep its commands in step with the bus API and its `/docs`.
 
-- **Versioning**: the `VERSION` constant near the top of the script (`dev! --version` prints it, currently `2.7`). Bump it whenever you make a user-visible behavior change.
+- **Session key** (`X-Agent-Session`) is `<host>-<supervisor pid>-<starttime>`, found by walking
+  the process ancestry to the first `claude`. A fixed hop count would key on a wrapper shell that
+  dies every call, and the server allocates a new permanent number for every unseen key.
+  `AGENT_BUS_SESSION` overrides the key; `AGENT_BUS_SESSION=none` sends no header, for callers that are
+  not sessions (e.g. `agent-update-check.sh` under a timer).
+- **One live session per token (409).** The client, not the server, tells a crashed predecessor
+  from a rival: if the holder's pid is gone or its start time no longer matches, `evict_session`
+  clears it sessionlessly and retries once, silently. Anything that might be alive is reported
+  with the exact `unregister <n>` to run and never auto-evicted — being wrong must cost a wait,
+  not a working session.
+- **The 409 is reported through a flag file plus an `EXIT` trap**, not a return code: most
+  commands end `api ... | pretty` or run `$(api ...)`, and both swallow `api`'s status. POSIX runs
+  `EXIT` traps only in the main shell, so no subshell can consume the flag. Commands that
+  deliberately absorb a refusal call `bus_conflict_handled`.
+- **`wake`** long-polls and exits only on real mail. It also exits when its supervisor dies (so a
+  ghost cannot hold mail for no one), and after a 60 s damp when refused (its exit re-invokes the
+  agent, whose Stop hook re-arms it). **Ack means handled:** monitors `ack <id>...` exactly what
+  they acted on; `--ack` and `ack-all` are lossy and are not the monitor's path.
+- **`unregister`** with no argument retires this session; it self-gates on the token so a
+  `SessionEnd` hook can call it unconditionally:
+  `{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"agent-bus-cli.sh unregister 2>/dev/null || true"}]}]}`.
+  `~/.claude/settings.json` is hand-rolled on each box and lives in no repo. `unregister <n>`
+  retires another session of the same agent.
+- **`onboard`** prints the session-start briefing (the SessionStart hook's output). It is read by
+  every agent at every `/clear`, so keep it short and imperative.
 
-- **Named identity** (v2.5+): the in-container login user and home are the container's name — `dev-speedy` runs as user `speedy`, home `/home/speedy`, GECOS `Speedy` (finger/pinky show it). `container_username` sanitizes the slug to a valid Unix name (hyphens→underscores, leading-non-letter/reserved-name→`u_` prefix, `dev` left as-is). The GECOS full name is **prompted on first create** (`ensure_fullname`, defaulting to `container_fullname` — the title-cased slug — so a single-word name like `speedy` can still be given "Speedy Gonzales") and persisted to `<name>/fullname`; `read_fullname` reads it back on every recreate (falling back to the title-cased slug for legacy containers with no file). Both the user and full name flow to the Dockerfile as `DEV_USER`/`DEV_FULLNAME` build args (always passed by `build_image`, so their heredoc defaults are never used); `DEV_FULLNAME` is deliberately **not** in `build_signature`, so editing `<name>/fullname` alone won't force a rebuild — it takes effect on the next real recreate. Host `UID`/`GID` still drive the account, so bind-mount permissions are unchanged — only the name/home differ. `resolve_username` decides the user by grepping the container's own Dockerfile for `ARG DEV_USER`: **pre-2.5 containers keep `dev`/`/home/dev`** (their on-disk Dockerfile lacks the ARG and `write_default_dockerfile` never overwrites it), so upgrades never mismatch the user against the existing image. All user-facing paths derive from the resolved user — `run_container` mounts claude/Dockerfile at `/home/<user>/…`, `attach_container` execs `-u <user>`. The entrypoint moved to a fixed root-owned `/usr/local/bin/entrypoint.sh` (home-independent; `~` still resolves to the login user's home at runtime since PID-adjacent processes run as `DEV_USER`).
+## agent-bus-fsd.sh
 
-- **Mount set** (`<name>/mounts/`): each container remembers folders as symlinks — the symlink **name** is the absolute path with `/` encoded as backtick (`\140` via `tr`) so names are unique by construction (no basename collisions) and the mount path decodes straight from the name; the **target** is the real folder (a free `[ -e ]` existence check + readable `ls -l`). `--save` adds the folder (`add_mount`, idempotent `ln -sfn`) and mounts the whole live set; `--only` mounts just the passed folder and saves nothing; a bare invocation **prompts** save/only (`prompt_mode`) unless the folder is already saved (then it's treated as save, no prompt). `build_mount_list` resolves the folders to mount and skips dead symlinks (folder deleted on host) with a warning; an empty/all-dead set falls back to the invocation folder so a container never launches with no mount. Prune a folder by hand: `rm <name>/mounts/<link>`. `migrate_legacy_folder` seeds `mounts/` from the old single `folder` marker on first run of a pre-3.0 container.
+Serves this box's source tree to the bus web UI's Files tab. The bus cannot see anyone's disk and
+must not learn how ("the bus stays frozen; new integrations are clients"), so **no bus endpoint
+exists for it**.
 
-- **State home** `~/.local/dev-container/` (override with `DEV_CONTAINER_HOME`, used by tests) is the only state store: a shared `.env` and one `<name>/` dir per container holding `.env` (per-name), `Dockerfile` (+ `.dockerignore`) — the per-container build recipe, `port` (plain text), `mounts/` (the saved-folder symlink set), `folder` (working-dir hint / pre-3.0 fallback), `fullname` (the login user's GECOS, asked on first create — see **Named identity**), `.build-sig` (build-skip signature), `keep-alive` (marker: present ⇒ opt out of idle-suspend), and `claude/` (persistent `/home/<user>/.claude`).
+- **Topics, not DMs** (`fs-req` in, `fs-rsp` out, requests addressed by `meta.agent`). A DM would
+  append every click to permanent history, and an inbox long-poll would fight the session monitor
+  for the claim on the bare agent name.
+- **Replies correlate on `meta.rid`, not order.** Handlers run double-forked (`( cmd & )`), off
+  the reader loop: the bus drops nudges to slow subscribers, and a request exists only as a nudge.
+  A plain `cmd &` leaks a zombie per request.
+- **Reconnect backoff resets after a connection lasting ≥ 60 s** — keyed on duration, not on
+  having read a line (a 401 still writes a body). Without the reset, the 30 s cap ratchets, and
+  the missed seconds are silent: the bus drops nudges for absent subscribers with no log line.
+- **The reader is `curl` into a FIFO read by the daemon's own shell**, not `curl | while read`:
+  a backgrounded pipeline puts the loop in a subshell, so `kill` would orphan a second live
+  responder. `stop_reader` runs on `EXIT`/`INT`/`TERM` and is idempotent.
+- **Three answer sizes:** text under `AGENT_BUS_FS_MAX_INLINE` (256 KiB) in `meta.content`
+  (the bus rejects an empty `body`); larger or binary files as content-addressed blobs; over
+  `AGENT_BUS_FS_MAX_BLOB` (100 MiB) a clear refusal.
+- **Containment is on the logical path.** `..` is rejected as a whole component; the resolved
+  path must sit under the root or one of its direct children (so deliberate symlinks such as
+  `marvin-memories` work). "Outside the root" and "does not exist" return the same message, so
+  probing cannot map the filesystem.
+- **Gitignored files and `.git` are withheld** (`AGENT_BUS_FS_GITIGNORE`, default on). That is
+  the only layer browsing exposes beyond what pushing already does, and `.git` packs hold deleted
+  secrets. Checked at listing time and again on read. Any token may browse; there is no per-agent
+  ACL.
+- **Fail closed:** with the flag on and no `git`, the daemon refuses to start.
+- Search (`fs.grep`) is advertised through `ops` on `fs.ping`. Its engine must be a real binary:
+  `command -v rg` can be satisfied by a shell function.
 
-- **Idle-suspend** (default on, `SUPERVISOR_CMD` in `run_container`): the container's PID 1 is a small `sh` supervisor (not `tail -f /dev/null`) that waits for the first interactive session, then exits — stopping the container — once no session has been attached for `DEV_SUSPEND_IDLE` (default 20) seconds. Sessions are counted as numeric slave nodes in `/dev/pts` (one per `docker exec -it`), so it tracks **all** attached shells regardless of who launched them, and needs no docker socket (PID 1 exiting is what stops the container). Consequence, stated honestly in `--help`: **background/detached work holds no pty**, so a dev server on `:8000` or a bus agent does *not* keep the container alive — that's what `--keep-alive` is for. `--keep-alive` swaps the supervisor for `tail -f /dev/null`, is remembered via the `keep-alive` marker (so recreates preserve it; `rm` it to revert), and `container_keepalive` (inspects `.Config.Cmd`) lets resume detect a run-mode change. Tunable at runtime via `DEV_SUSPEND_IDLE`/`DEV_SUSPEND_STARTUP` env.
-- **Naming**: container and image are both `dev-<name>` (namespaces are separate); names are slugified. Host `port` maps to container port 8000.
-- **Env hierarchy** (`load_env_files`): host env → shared `.env` → per-name `.env`, later wins. Both files are plain `KEY=value` (no quotes/`$expansion`) so they are both **sh-sourced at build time** (driving `GITHUB_TOKEN_DOTFILES`/`GITHUB_USERNAME`/`GITCONFIG`) and passed to the container via `docker run --env-file` (added only if the file exists — docker errors on a missing one). `port` is deliberately kept out of `.env` so no `PORT` var leaks to web frameworks. Everything in these files is visible in the container at runtime; only the dotfiles token stays out of image layers via the BuildKit secret.
-- **Start semantics** (`cmd_up`): running → compare the running container's folder-mount sources (`current_folder_mounts`, from `docker inspect`, excluding the claude/Dockerfile/`docker.sock` mounts) to the desired set; equal → report and quit; different → offer to recreate to apply (Docker fixes bind mounts at create time). stopped → **fast-resume** when the mount set, `image_up_to_date`, and `container_keepalive` all match (`docker start` — no rebuild, preserves the in-container fs; the suspend/resume happy path); otherwise `docker rm` + recreate. none → confirm, run the token flow, build, run, attach. The working dir is always the invocation folder; the mount **set** is sticky, the working dir is not.
-- **Build skip** (`build_image` + `build_signature`/`image_up_to_date`): after a successful build the sha256 of the Dockerfile + build args is stored in `<name>/.build-sig`; a later start with the image present and a matching signature skips `docker build` entirely, so a folder-add recreate is just `docker rm` + `docker run` (~1–2s). `image_up_to_date` also gates fast resume.
-- **Token flow** (`ensure_token`, on first create only): (e)nter / (g)enerate (`openssl rand -hex 32`) / (s)kip. On enter/generate the token is written to `<name>/.env` and a paste-ready `config/agents.json` fragment (name + `token_sha256` via `shasum`/`openssl`) is printed for the bus operator.
-- **Persona flow** (`ensure_persona`, on first create only, runs *after* `seed_claude` so it never clobbers the seeded CLAUDE.md): prompt for a persona name, then (g)enerate a bio with `claude -p --model sonnet` (accept/regenerate/edit loop) / (w)rite your own in `$EDITOR` / (s)kip. The bio is saved to `<name>/claude/persona.md` and pulled in by appending a single `@persona.md` import line to `<name>/claude/CLAUDE.md` (idempotent — `grep -qxF`; the rest of that file is never rewritten). Gives each agent a legible identity on the bus. Requires host `claude` only on the generate path; skipped/empty personas write nothing.
-- **Path parity**: every mounted folder is bind-mounted at the *same absolute path* inside the container (`run_container` loops `mount_list` emitting `-v "$m:$m"`; `HOST_PROJECT_PATH` build arg + `-w` set the working dir to the invocation folder), so host paths resolve identically inside. `warn_git` runs per mounted folder and warns (does not block) when one is a git worktree (`.git` is a file) or a repo subfolder, since git will not work with the repo root unmounted.
-- **GitHub fork+clone** (v2.7+, `--fork` / opt-in prompt): the deliberate isolation-preserving answer to "give the agent its own git checkout". Worktrees were rejected — a worktree borrows the main repo's `.git`, which would force mounting the host repo and break the isolation stance — so instead each agent gets a **self-contained clone of its own GitHub fork** under `<name>/repo`, the *only* thing mounted (the live tree is never exposed). Strictly opt-in and **first-create only**: when the invocation folder is inside a repo with a `github.com` origin (`github_remote` parses ssh/https/scp URL forms), `cmd_up` **asks** — but only when no `--save`/`--only` flag was given, or when `--fork` pre-answers yes. On yes (past the confirm gate, so an abort writes nothing): `ensure_github_identity` prompts for the agent's bot GitHub username + PAT + email (validated via `gh api user`, stored as `GITHUB_AGENT_USER`/`GITHUB_AGENT_TOKEN`/`GITHUB_AGENT_EMAIL` in `<name>/.env` — runtime env only, like `AGENT_BUS_TOKEN`, *not* build args), then `setup_github_clone` runs `gh repo fork` (as the agent), `gh repo clone` the fork into `<name>/repo` (retry loop — a fresh fork takes a beat to be clonable), adds an `upstream` remote, and checks out a branch named after the container. The clone then becomes the mounted working copy via the **normal mount set** (`folder=<clone>`, `mode=save`, `add_mount`) — reusing all existing path-parity/`build_mount_list`/list/`kill`-cleanup machinery. Any failure (no `gh`, empty identity, clone fails) falls back to mounting the folder directly (mode stays `save`, so the container never launches mountless). Container-side auth is a guarded block appended to `~/.bashrc` in the default Dockerfile (which also gains `github-cli`): when `$GITHUB_AGENT_TOKEN` is present it exports `GH_TOKEN`, sets git `user.name`/`user.email` to the agent, and installs a credential helper storing the token **single-quoted** so git expands it from the env at push time (never on disk). The agent commits and runs `git push -u origin <name>` + `gh pr create` itself. **Caveats**: (1) `current_folder_mounts` must exclude only `<name_dir>/claude` and `<name_dir>/Dockerfile`, *not* all of `<name_dir>/*`, or the clone at `<name_dir>/repo` drops out of the resume diff and forces a recreate every run; (2) `repo` is in `.dockerignore` so the clone isn't sent as build context; (3) `kill` deletes the local clone but leaves the GitHub fork intact (noted in its output); (4) the script can't create the GitHub *account* — the operator makes the bot account once.
-- **Claude state**: per-name `<name>/claude/` is mounted as `/home/dev/.claude`, seeded **host-side once** from `~/.claude` (settings/CLAUDE.md/credentials/skills/plugins — same `tar` filter as before, no `docker exec`). Credentials still also flow via the `CLAUDE_CODE_CREDENTIALS`/`CLAUDE_JSON` env vars that the entrypoint writes at startup.
-- **Isolation stance** (stated honestly in `--help`): the container sees only its saved folder set (or, with `--only`, the single passed folder) + its claude dir — but the saved set grows on every `--save`, so a long-lived container's reach is whatever has accumulated (`ls -l <name>/mounts`). Network is **not** isolated. `docker.sock` is **not** mounted unless `--docker` is passed — it grants root-equivalent host access (on macOS the whole Docker VM), so it is opt-in.
-- **Dockerfile ownership**: each container owns exactly one Dockerfile at `$STATE_HOME/<name>/Dockerfile`, built with context `$STATE_HOME/<name>/` (a generated `.dockerignore` (kept up to date via `ensure_dockerignore`, which appends newer entries to pre-existing files) keeps that dir's `.env`/`port`/`folder`/`fullname`/`mounts`/`.build-sig`/`claude` state and secrets out of the build context). `write_default_dockerfile` writes a batteries-included default (Alpine + bash/git/curl, Claude Code, chezmoi dotfiles, tmux, and the creds-injecting entrypoint) there on first create (past the confirm gate, so an aborted create leaves no state) — the script is distributed standalone, so this default is **embedded as a heredoc** rather than read from disk, and it is the single source for this repo's own dev container too (edit the heredoc to change it). The Dockerfile is **bind-mounted rw at `~/Dockerfile`** (the login user's home) so the container can edit its own build recipe; edits take effect on the next recreate. The target folder's own Dockerfiles are **ignored** — crib from them by hand. There is no `dev! init` and no per-folder `Dockerfile.dev`. Its only hard requirement is a login user with bash (named `DEV_USER`, defaulting to the container name — see **Named identity**), created with `HOST_UID`/`HOST_GID` build args for volume permission parity.
+## Other files
 
-## Architecture: agent-bus-cli.sh
-
-`agent-bus-cli.sh` is a POSIX-sh curl/jq wrapper over the **agent-bus** HTTP API (the bus service now lives in its own repo at `../agent-bus`). It reads `AGENT_BUS_URL`/`AGENT_BUS_TOKEN` from the environment; `dev-container.sh` passes both into the containers it launches when they are set on the host. Keep its commands in sync with the bus API.
-
-- **Session identity** (`session_supervisor`/`session_key`, sent as `X-Agent-Session` by `api`): the bus makes a session addressable as `<agent>-<n>` given a key that is stable for the session's life and dies with it — the server allocates a new number for every key it has not seen, so a key that varied per invocation would burn one every 120s. The key is `<host>-<supervisor pid>-<starttime>`, where the supervisor is found by **walking the ancestry to the first `claude`** rather than guessing a hop count: the harness wraps each command in a shell and a pipeline or nested script adds more, so a fixed guess would key on a wrapper that dies every call. It falls back to the wrapper's parent (what the `wake` ghost-exit check has always used) and to no key at all when there is no supervisor, in which case the bus behaves exactly as it did before sessions existed. `AGENT_BUS_SESSION` overrides the derivation; **`AGENT_BUS_SESSION=none` sends no header at all**, which is what a caller that is not a session wants — `agent-update-check.sh` runs under a systemd timer where there is no `claude` to find, so the fallback minted a new number every tick. `wake` watches the same supervisor and `DELETE /sessions/me` on its death.
-- **One live session per token, and the client is what tells the two causes apart.** The bus refuses an unseen key while another session of that agent is live (409, holder named). Two apps answering as one agent is a fault — bare-name mail lands wherever the claim happens to be and nobody can say which mind acted — but the *server* cannot tell a crashed predecessor from a rival, and the client can: the key is `<host>-<pid>-<starttime>`, so on the same box `session_key_is_corpse` simply looks. Provably dead (pid gone, or its start time no longer matches — a recycled pid is still a corpse) means wreckage: `evict_session` clears it **sessionlessly**, since presenting our own key would have the rule block the very call that clears it, and the request is retried once, silently — a successor after a reboot is not an event anyone needs told about. Anything else is reported loudly with the exact `unregister <n>` to run, and **never** auto-evicted: a live pid is precisely the case the rule exists to catch. The judgement is deliberately asymmetric — a pid we can see but cannot read a start time for counts as alive, because being wrong costs a working session rather than a wait.
-  **Reporting the refusal needed a flag file, not a return code.** Nearly every command ends `api ... | pretty`, which exits with `pretty`'s status, and the rest read `$(api ...)` in a subshell; either way a `return` from `api` is lost and the script exits 0 with a loud error on stderr — fine for a human, useless for a hook. `session_conflict` therefore touches `$CONFLICT_FLAG` (named by `$$`, which is the *main* shell's pid even inside a subshell) and an `EXIT` trap turns it into exit `$BUS_CONFLICT_RC`. That only works because POSIX runs an EXIT trap in the main shell alone, never in a subshell — verified in dash and bash before relying on it — so no subshell can consume the flag first. Commands that deliberately absorb a refusal (`emit_heartbeat`, which must never break a session start; `unregister` with no argument) call `bus_conflict_handled` to clear it, or their own clean exit would be reported as a failure. `wake` is the exception that must speak: a refused monitor never monitors, so it says so and exits — after a 60s damp, because exiting is exactly what makes the harness re-invoke the agent, whose Stop hook arms a fresh `wake`.
-- **`unregister` is the session lifecycle's other half.** No argument = `DELETE /sessions/me` for this session, self-gating on the token exactly like `onboard` so a Claude Code `SessionEnd` hook can call it unconditionally: `{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"agent-bus-cli.sh unregister 2>/dev/null || true"}]}]}`. That file is hand-rolled per box and lives in no repo, so it is documented here and applied by the operator. With `<n>` it retires another session of the same agent — the escape hatch the refusal message names, sent with no session header for the same reason `evict_session` is.
-
-## Architecture: agent-bus-fsd.sh
-
-Serves this box's source tree to the agent-bus web UI's **Files** tab. It exists because the bus is a scratch container on another machine that cannot see any agent's disk — and per the bus's own rule ("the bus stays frozen; new integrations are clients") never should. So the browsing feature is split: the UI half ships in `agent-bus/ui.go`, this half runs beside the files. **No bus endpoint was added for it.**
-
-- **Topics, not DMs, and that is load-bearing.** Requests arrive on `fs-req` and replies go to `fs-rsp`. A DM would append every click to `agents/<name>/messages.jsonl` and `sent.jsonl`, which nothing ever prunes, whereas a topic publish touches only `topics/<name>/<date>.jsonl`. Worse, a daemon long-polling an inbox would **contend for the claim on the bare agent name** with the session monitor that legitimately holds it. Requests carry `meta.agent`; the daemon answers only its own and ignores the rest, so every agent can watch one shared topic.
-- **Correlation, not ordering.** Each request carries a `meta.rid` echoed in the reply. Handlers are backgrounded, so replies genuinely arrive out of order — the UI matches on `rid` and times out at 20s. Handlers must stay off the reader loop for a sharper reason than latency: the bus notifies SSE watchers through a 16-deep channel it *drops* from when full ("slow subscriber: drop the nudge; disk has the message"). That is harmless for an inbox you can re-read, and fatal for a request that exists only as a nudge. Backgrounding is **double-forked** (`( cmd & )`) so the orphan is reaped by init; a plain `cmd &` leaks one zombie per request, since a POSIX shell reaps only what it waits for.
-- **The reconnect backoff resets, and the reset is the load-bearing half.** `serve` doubles its sleep to a 30s cap on every dropped stream, which is only tolerable because a connection that lasted ≥60s puts it back to 1s. Without that, the cap is a one-way ratchet: an outage last week pins every reconnect since at 30s, so a routine bus restart today costs 30s off the stream rather than 1s. Those seconds are silent by construction — per the bullet above the bus drops nudges to absent subscribers with no queue, no retry and no log line — so the only symptom is a Files-tab click that spins to the UI's 20s timeout and then works on refresh, which reads as flakiness rather than as a daemon that was not subscribed. The reset keys on *duration*, not on having read a line: a rejected connection still writes its error body into the FIFO, so counting lines would score a 401 as success and reconnect at 1s forever.
-- **A plain `kill` must really stop it.** The reader is `curl` writing into a FIFO, with the `while read` loop in the daemon's own shell — not the obvious `curl | while read`. Backgrounding a pipeline puts *both* halves in subshells, so killing the pid the operator holds orphans the loop onto init, still subscribed and still answering. Two daemons for one agent then both reply to the same `rid` and the UI keeps whichever lands first, which makes a restart after an `AGENT_BUS_FS_ROOT` change serve the old root about half the time — silently. The FIFO also makes `$!` name `curl` itself: `$!` after a backgrounded *pipeline* is its last element, but after a backgrounded *function* wrapping one it is the wrapper subshell, so the request stream is opened inline rather than through `curl_auth` (the token still travels on stdin, never argv). `stop_reader` runs from `EXIT`, `INT` and `TERM`, and is idempotent because `serve` reconnects in a loop.
-- **Three sizes of answer.** Text under `AGENT_BUS_FS_MAX_INLINE` (256 KiB) rides in `meta.content` — deliberately in meta rather than `body`, because the bus rejects an empty body (so an empty file would 400) and because a topic feed should not have whole source files pasted into it. Anything larger, or anything binary, is uploaded as a blob and referenced by id; blobs are content-addressed, so re-reading an unchanged file uploads nothing. Over `AGENT_BUS_FS_MAX_BLOB` (100 MiB, matching the server's own cap) it refuses with a clear error rather than a 413.
-- **Containment is on the logical path.** `..` is rejected as a whole component (never as a substring, so `..hidden` stays reachable), then the resolved path must sit under the root **or under one of the root's direct children**. That second clause is what makes a deliberate symlink like `~/src/marvin-memories -> ~/.claude/.../memory` work while a link escaping to `/` does not. "Outside the root" and "does not exist" deliberately return the *same* message: telling them apart lets a caller map the filesystem above the root by probing.
-- **The token is passed on stdin, not in argv** (`curl_auth` writes a `-K -` config). This daemon is long-lived, so an argv copy would sit in `ps` for every co-resident process to read for as long as it runs. Callers must therefore leave stdin free — which is why `publish_rsp` spools its body to a temp file.
-- **Listing** uses one `find -printf` on GNU and falls back to a fork-per-entry shell loop elsewhere; a 40k-entry `node_modules` makes the difference obvious. Rows are sorted *before* the `AGENT_BUS_FS_MAX_ENTRIES` cut, so truncating to 3 gives the alphabetical first three rather than an arbitrary three. Filenames containing a tab or newline would corrupt the TSV the jq pass parses, so those rows are dropped rather than mangled.
-- **Access is exactly the bus's** — any valid token, no per-agent ACL, and tracked contents served raw with no redaction. Sound, because anything committed is already on the remote for anyone with repo access; the browser adds no exposure there.
-- **What it withholds is the gitignored layer** (`AGENT_BUS_FS_GITIGNORE`, default on), because that is precisely the delta — the files a browser would reveal that pushing never would, and where secrets live by convention. Using the repo's own `.gitignore` beats any pattern list this script could guess: it is maintained by the people who know what must not leave. Measured on marvin's box, that delta was two files (`appsettings.Development.json` in each umbrella checkout, holding a dev connection string and a tenant encryption key), against ~22k build-output files that vanish as a welcome side effect. Filtering is one batched `git check-ignore --stdin` per listing (38ms on a 494-entry directory), applied *before* the entry cap so the reported count is of entries actually served, and re-checked on read — hidden from a listing is not the same as refused, and a direct request must be refused too.
-- **`.git` is withheld under the same flag**, which is not the same rule and is worth stating separately: a pack file holds every version of every tracked file, including a secret that was committed and later deleted. Withholding `.gitignore`d files while serving `.git` would be theatre. `.gitignore` itself stays readable — the `*/.git/*` test matches a whole path component, so `.gitignore` is untouched.
-- **Fail closed at startup.** With the flag on and `git` absent, the daemon refuses to start rather than quietly serving everything; a control that silently stops applying is worse than one that was never switched on. `check` prints how many ignored files each repo under the root is withholding, so starting the daemon says what it is holding back instead of leaving the operator to guess.
-
-## Other contents
-
-- `dev-container-per-repo.sh`: the previous git-worktree-based `dev!` (each branch gets a worktree + container under `../{repo}.worktrees/{port}/{branch}/`), kept as a separate tool for repo/worktree-centric workflows. POSIX sh; superseded by `dev-container.sh` for the folder-based model but not deprecated.
-- `check-tools.sh`: checks a pipe-delimited tool table (`cmd|description|apt|brew|url|alt-cmd`) for missing CLI tools and reports chezmoi drift. Add new tools by appending to the `TOOLS` heredoc.
-- `jellyfin-media-player/`: bash scripts, a systemd unit, and udev rules for a Jellyfin HTPC setup (cage/Wayland kiosk, PipeWire HDMI audio watchdog). Machine-specific, not distributed.
+- `agent-run.sh` — started by `agent-claude.service`; runs the box's one Claude Code agent (one per
+  VM), restores its environment via `agent-env.sh`, and opens it with a prompt so its Stop hook
+  arms the bus monitor.
+- `agent-env.sh` — sourced, not executed: restores the agent's environment under systemd, where
+  `EnvironmentFile=` and `bash -lc` both fail silently.
+- `agent-supervision-install.sh` — `install` / `cutover` / `status`: the systemd steps chezmoi
+  cannot do (linger, daemon-reload, enable, handing a tmux-started agent over to systemd).
+- `agent-update-check.sh` — run by `agent-update.timer`; restarts the agent when the running build
+  differs from the installed one (the restart *is* the update), and does the same for long-lived
+  daemons.
+- `agent-bus-monitor-guard.sh` — Stop hook; blocks idle while no `wake` is running. Self-gates on
+  `AGENT_BUS_TOKEN`.
+- `systemd/` — `agent.target`, `agent-claude.service`, `agent-fsd.service`, `agent-update.{service,timer}`.
+- `check-tools.sh` — reports missing CLI tools from its `TOOLS` table (`cmd|description|apt|brew|url|alt-cmd`) and chezmoi drift.
+- `statusline-command.sh` — Claude Code status line.
+- `docs/plans/` — historical design plans.
+- `jellyfin-media-player/` — bash, systemd and udev files for one Jellyfin HTPC. Machine-specific,
+  not distributed.

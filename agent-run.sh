@@ -40,6 +40,10 @@
 #   AGENT_NAME          bus identity + --remote-control name   (default: $USER)
 #   AGENT_WORKDIR       cwd for the session                    (default: ~/src)
 #   AGENT_CLAUDE_ARGS   flag list, word-split                  (default: below)
+#   AGENT_EFFORT        --effort level; empty = don't pass it  (default: xhigh)
+#                       Passed on the command line because effortLevel in
+#                       settings.json did not survive restarts: sessions came
+#                       back at the harness default (medium).
 #   AGENT_START_PROMPT  the opening turn
 #   AGENT_RESUME        1 = --continue the previous conversation (default 1)
 #   AGENT_UNIT          the systemd --user unit running this   (default: agent-claude.service)
@@ -70,6 +74,7 @@ conf="${XDG_CONFIG_HOME:-$HOME/.config}/agent/run.conf"
 AGENT_NAME="${AGENT_NAME:-$(id -un)}"
 AGENT_WORKDIR="${AGENT_WORKDIR:-$HOME/src}"
 AGENT_CLAUDE_ARGS="${AGENT_CLAUDE_ARGS:---dangerously-skip-permissions --thinking-display summarized}"
+AGENT_EFFORT="${AGENT_EFFORT-xhigh}"
 AGENT_RESUME="${AGENT_RESUME:-1}"
 AGENT_UNIT="${AGENT_UNIT:-agent-claude.service}"
 # One prompt for both paths. It has to read correctly on a resumed session AND
@@ -147,6 +152,9 @@ facts=$(launch_facts 2>/dev/null) || facts=
 # Word splitting on AGENT_CLAUDE_ARGS is deliberate: it is a flag list.
 # shellcheck disable=SC2086
 set -- claude $AGENT_CLAUDE_ARGS --remote-control "$AGENT_NAME"
+if [ -n "$AGENT_EFFORT" ]; then
+    set -- "$@" --effort "$AGENT_EFFORT"
+fi
 if [ "$AGENT_RESUME" = 1 ]; then
     set -- "$@" --continue
 fi

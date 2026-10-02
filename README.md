@@ -168,11 +168,12 @@ agent-supervision-install.sh cutover    # hand a hand-started tmux agent to syst
 ```
 
 Per-box overrides go in `~/.config/agent/run.conf` (`AGENT_NAME`,
-`AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_START_PROMPT`, `AGENT_RESUME`,
+`AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_EFFORT`, `AGENT_START_PROMPT`, `AGENT_RESUME`,
 `AGENT_UPDATE_MODE`, `AGENT_IDLE_SETTLE_SECS`, `AGENT_FETCH_MIN_SECS`,
 `AGENT_KEEP_VERSIONS`). Set `AGENT_UPDATE_MODE=notify` on a box that should
 report drift and never act on it, or `AGENT_RESUME=0` on one whose agent should
-always start from a clean context.
+always start from a clean context. `AGENT_EFFORT` (default `xhigh`) is passed as
+`--effort` on every launch; set it empty to fall back to the harness default.
 
 ## Install
 

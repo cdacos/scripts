@@ -214,7 +214,18 @@ resolve_me() {
         ME="$AGENT_BUS_FS_AGENT"
         return
     fi
-    ME=$(api GET /whoami | jq -r '.agent // empty')
+    # At boot the network can come up after this daemon: a --user manager has no
+    # network-online.target, so the unit's After= on it is a no-op, and five quick
+    # DNS failures used to exhaust StartLimitBurst and park the unit in `failed`.
+    # Retry transport failures (curl non-zero) for up to 2 min; any HTTP answer,
+    # a 401 included, is final.
+    _n=0
+    until _who=$(api GET /whoami); do
+        _n=$((_n + 1))
+        [ "$_n" -lt 24 ] || error "bus unreachable at ${AGENT_BUS_URL} after 2 min"
+        sleep 5
+    done
+    ME=$(printf '%s' "$_who" | jq -r '.agent // empty')
     [ -n "$ME" ] || error "could not resolve own agent name from /whoami (bad token?)"
 }
 

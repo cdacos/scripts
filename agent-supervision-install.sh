@@ -7,6 +7,10 @@
 #             claude, starts agent.target, waits for the new session, and only
 #             then retires the old tmux server. Detached, because it outlives the
 #             agent that launched it.
+#   up        bring the agent back after a reboot or a crash: linger, reset any
+#             failed unit, start agent.target, then check the session's screen
+#             for the prompts that block it invisibly (expired login, folder
+#             trust). Safe to re-run; never restarts a running agent.
 #   status    what is running, what version, and whether it has drifted.
 #
 # The units and scripts themselves arrive via chezmoi externals; this only does
@@ -19,6 +23,16 @@ UNITS="agent.target agent-claude.service agent-fsd.service agent-update.timer"
 
 log() { echo "$(date -Is) $*"; }
 die() { echo "install: $*" >&2; exit 1; }
+
+# A --user unit dies at logout and never starts at boot without this.
+ensure_linger() {
+    if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
+        log "enabling linger for $(id -un)"
+        sudo -n loginctl enable-linger "$(id -un)" 2>/dev/null ||
+            loginctl enable-linger "$(id -un)" ||
+            die "could not enable linger; a --user unit will not survive logout"
+    fi
+}
 
 cmd_install() {
     for t in script tmux jq flock systemctl loginctl pgrep; do
@@ -41,14 +55,7 @@ cmd_install() {
         die "$envfile calls _daily_check unconditionally. Run 'chezmoi update' (pull AND apply -- plain 'chezmoi apply' will not do it) before installing, or this box will silently consume the daily tool-and-drift check."
     fi
 
-    # A --user unit dies at logout and never starts at boot without this.
-    if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
-        log "enabling linger for $(id -un)"
-        sudo -n loginctl enable-linger "$(id -un)" 2>/dev/null ||
-            loginctl enable-linger "$(id -un)" ||
-            die "could not enable linger; a --user unit will not survive logout"
-    fi
-
+    ensure_linger
     systemctl --user daemon-reload
     # shellcheck disable=SC2086
     systemctl --user enable $UNITS
@@ -119,6 +126,58 @@ cmd_cutover() {
     exit 0
 }
 
+cmd_up() {
+    [ -f "$HOME/.config/systemd/user/agent-claude.service" ] ||
+        die "units not installed -- run 'chezmoi update', then '$0 install'"
+    ensure_linger
+    systemctl --user daemon-reload
+    # A unit that hit its start limit stays `failed` until reset; start alone
+    # would be refused.
+    # shellcheck disable=SC2086
+    systemctl --user reset-failed $UNITS 2>/dev/null || true
+
+    # start, not restart: a running agent is left exactly as it is. If the unit
+    # is down, ANY claude on the box -- a hand-started tmux agent or a human's
+    # own interactive session -- makes agent-run.sh refuse (one per VM), so the
+    # start would only burn StartLimitBurst and park the unit in `failed`.
+    if ! systemctl --user is-active --quiet agent-claude.service &&
+        holder=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1) && [ -n "$holder" ]; then
+        systemctl --user start agent-fsd.service agent-update.timer
+        ps -o pid=,lstart=,args= -p "$holder" | cut -c1-120 || true
+        log "NOT starting the agent: claude PID $holder already owns this box."
+        log "  a hand-started agent: $0 cutover. Your own session: exit it, re-run $0 up."
+        cmd_status
+        return 1
+    fi
+    systemctl --user start agent.target agent-update.timer
+
+    n=0
+    while [ "$n" -lt 60 ] && ! pgrep -u "$(id -u)" -x claude >/dev/null 2>&1; do
+        sleep 1; n=$((n + 1))
+    done
+    pgrep -u "$(id -u)" -x claude >/dev/null 2>&1 || {
+        systemctl --user status agent-claude.service --no-pager -n 20 2>&1 || true
+        die "no claude after 60s"
+    }
+
+    # These prompts block the opening turn while every unit reads active, so
+    # only the screen shows them. Give the TUI a moment to draw first.
+    sleep 10
+    # Only the bottom of the screen: further up is conversation, which can
+    # mention a login without being blocked by one.
+    screen=$(tmux -L agent capture-pane -p -t agent 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 15 || true)
+    if printf '%s\n' "$screen" | grep -qiE '/login|log ?in again|expired|trust (this|the files)|do you trust'; then
+        printf '%s\n' "$screen"
+        log "ACTION NEEDED: the agent looks stuck at a prompt. Check: tmux -L agent attach"
+        log "  answer it (e.g. /login), then detach with Ctrl-b d"
+        stuck=1
+    fi
+    systemctl --user is-active --quiet agent-fsd.service ||
+        log "WARNING agent-fsd.service is not active: journalctl --user -u agent-fsd.service -b"
+    cmd_status
+    [ -z "${stuck:-}" ] || return 2
+}
+
 cmd_status() {
     echo "--- units ---"
     # shellcheck disable=SC2086
@@ -142,6 +201,7 @@ case "${1:-install}" in
     install) cmd_install ;;
     cutover) cmd_cutover ;;
     __cutover_worker) do_cutover ;;
+    up) cmd_up ;;
     status) cmd_status ;;
-    *) die "usage: $0 [install|cutover|status]" ;;
+    *) die "usage: $0 [install|cutover|up|status]" ;;
 esac

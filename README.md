@@ -165,7 +165,14 @@ Five things are worth knowing before adapting this:
 agent-supervision-install.sh            # linger, enable units, migrate the daemon
 agent-supervision-install.sh status     # what is running, and has it drifted?
 agent-supervision-install.sh cutover    # hand a hand-started tmux agent to systemd
+agent-supervision-install.sh up         # after a reboot: start whatever is down, flag a stuck login
 ```
+
+`up` never restarts a running agent. It exits 2 when the session's screen shows a
+prompt that blocks it while every unit reads healthy (an expired login, folder
+trust) -- `tmux -L agent attach`, answer it, detach with `Ctrl-b d`. Run it from a
+plain shell, not from a claude session: any claude on the box makes `agent-run.sh`
+refuse to start. Fleet-wide: `for h in marvin speedy tweety; do ssh "$h" agent-supervision-install.sh up; done`.
 
 Per-box overrides go in `~/.config/agent/run.conf` (`AGENT_NAME`,
 `AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_EFFORT`, `AGENT_START_PROMPT`, `AGENT_RESUME`,

@@ -5,6 +5,8 @@ Documentation=https://github.com/cdacos/scripts
 # take the agent down, and the daemon can be restarted after a config change
 # without disturbing a working session.
 PartOf=agent.target
+# network-online.target does not exist in a --user manager, so these two lines
+# order nothing; agent-bus-fsd.sh waits for the bus itself (resolve_me).
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300

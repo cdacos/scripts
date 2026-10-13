@@ -172,7 +172,7 @@ agent-supervision-install.sh up         # after a reboot: start whatever is down
 prompt that blocks it while every unit reads healthy (an expired login, folder
 trust) -- `tmux -L agent attach`, answer it, detach with `Ctrl-b d`. Run it from a
 plain shell, not from a claude session: any claude on the box makes `agent-run.sh`
-refuse to start. Fleet-wide: `for h in marvin speedy tweety; do ssh "$h" agent-supervision-install.sh up; done`.
+refuse to start. Fleet-wide: `for h in marvin speedy tweety; do ssh "$h" '~/.local/bin/agent-supervision-install.sh up'; done`.
 
 Per-box overrides go in `~/.config/agent/run.conf` (`AGENT_NAME`,
 `AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_EFFORT`, `AGENT_START_PROMPT`, `AGENT_RESUME`,

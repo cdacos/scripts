@@ -139,7 +139,10 @@ Five things are worth knowing before adapting this:
 * **The agent resumes rather than restarting cold.** `agent-run.sh` passes
   `--continue`, so a restart costs a repeated turn and one dead in-flight tool
   call — not the agent's context. This is what lets the idle gate be cheap: an
-  accurate gate is only worth building if interrupting is expensive.
+  accurate gate is only worth building if interrupting is expensive. With nothing
+  to continue, `claude --continue` exits 1, so a box with no transcript at all
+  under `~/.claude/projects` starts fresh instead; any other box still gets
+  `--continue`, and a mistake there shows as a restart loop, not a lost context.
 * **The idle gate is deliberately approximate, and deliberately small**: no
   un-acked bus mail, no transcript write for 120s, and no transcript *growth*
   during a 30s sample. Growth, not mtime — an idle session's `.jsonl` gets
@@ -168,11 +171,13 @@ agent-supervision-install.sh cutover    # hand a hand-started tmux agent to syst
 agent-supervision-install.sh up         # after a reboot: start whatever is down, flag a stuck login
 ```
 
-`up` never restarts a running agent. It exits 2 when the session's screen shows a
-prompt that blocks it while every unit reads healthy (an expired login, folder
-trust) -- `tmux -L agent attach`, answer it, detach with `Ctrl-b d`. Run it from a
-plain shell, not from a claude session: any claude on the box makes `agent-run.sh`
-refuse to start. Fleet-wide: `for h in marvin speedy tweety; do ssh "$h" '~/.local/bin/agent-supervision-install.sh up'; done`.
+`up` never restarts a running agent. It first waits (up to 5 min) for a running
+`agent-update.service`: `install` starts the timer, which on a box up longer than
+2 min fires at once, and its `claude update` is not an agent. It exits 2 when the
+session's screen shows a prompt that blocks it while every unit reads healthy (an
+expired login, folder trust) -- `tmux -L agent attach`, answer it, detach with
+`Ctrl-b d`. Run it from a plain shell, not from a claude session: any other claude
+session on the box makes `agent-run.sh` refuse to start. Fleet-wide: `for h in marvin speedy tweety porky wile daffy; do ssh "$h" '~/.local/bin/agent-supervision-install.sh up'; done`.
 
 Per-box overrides go in `~/.config/agent/run.conf` (`AGENT_NAME`,
 `AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_EFFORT`, `AGENT_START_PROMPT`, `AGENT_RESUME`,

@@ -24,6 +24,39 @@ UNITS="agent.target agent-claude.service agent-fsd.service agent-update.timer"
 log() { echo "$(date -Is) $*"; }
 die() { echo "install: $*" >&2; exit 1; }
 
+# The claude processes that are agents. `claude update` has the same name but is
+# the updater: it must never be the holder that makes `up` refuse, nor a target
+# of cutover's kill.
+agent_pids() {
+    for _p in $(pgrep -u "$(id -u)" -x claude 2>/dev/null || true); do
+        [ "$(tr '\0' '\n' <"/proc/$_p/cmdline" 2>/dev/null | sed -n 2p)" = update ] || echo "$_p"
+    done
+}
+
+any_alive() {
+    for _p in "$@"; do kill -0 "$_p" 2>/dev/null && return 0; done
+    return 1
+}
+
+# `install` starts agent-update.timer. On a box up longer than OnBootSec that
+# timer is already overdue, so it fires at once: `claude update`, then a drift
+# check that may restart agent-claude.service. An `up` straight afterwards took
+# the updater for an agent and refused (porky, 2026-10-14); a cutover would have
+# killed it mid-install. So both wait for it, bounded: the unit's own limit is
+# TimeoutStartSec=15min, and a hung fetch should not hold either step that long.
+UPDATE_WAIT_SECS=300
+wait_for_update_check() {
+    _n=0
+    while :; do
+        _state=$(systemctl --user is-active agent-update.service 2>/dev/null) || true
+        case "$_state" in activating | active | deactivating | reloading) ;; *) return 0 ;; esac
+        [ "$_n" -lt "$UPDATE_WAIT_SECS" ] || return 1
+        [ "$_n" -gt 0 ] || log "waiting for agent-update.service ($_state) to finish, up to ${UPDATE_WAIT_SECS}s"
+        sleep 5
+        _n=$((_n + 5))
+    done
+}
+
 # A --user unit dies at logout and never starts at boot without this.
 ensure_linger() {
     if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
@@ -76,20 +109,25 @@ cmd_install() {
 do_cutover() {
     mkdir -p "$STATE_DIR"
     log "cutover: starting"
+    if ! wait_for_update_check; then
+        log "cutover: FAILED -- agent-update.service still running after ${UPDATE_WAIT_SECS}s. Nothing was stopped; re-run cutover once it finishes."
+        return 1
+    fi
     old_tmux=$(pgrep -u "$(id -u)" -x tmux 2>/dev/null | head -n 1 || true)
-    old_claude=$(pgrep -u "$(id -u)" -x claude 2>/dev/null || true)
+    old_claude=$(agent_pids)
 
     if [ -n "$old_claude" ]; then
-        log "cutover: stopping hand-started claude: $old_claude"
         # shellcheck disable=SC2086
-        kill $old_claude 2>/dev/null || true
+        set -- $old_claude
+        log "cutover: stopping hand-started claude: $*"
+        kill "$@" 2>/dev/null || true
         n=0
-        while [ "$n" -lt 30 ] && pgrep -u "$(id -u)" -x claude >/dev/null 2>&1; do
+        while [ "$n" -lt 30 ] && any_alive "$@"; do
             sleep 1; n=$((n + 1))
         done
-        if pgrep -u "$(id -u)" -x claude >/dev/null 2>&1; then
+        if any_alive "$@"; then
             log "cutover: claude did not exit in 30s; sending SIGKILL"
-            pkill -KILL -u "$(id -u)" -x claude 2>/dev/null || true
+            kill -KILL "$@" 2>/dev/null || true
             sleep 2
         fi
     fi
@@ -99,7 +137,7 @@ do_cutover() {
 
     n=0
     while [ "$n" -lt 60 ]; do
-        newpid=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1 || true)
+        newpid=$(agent_pids | head -n 1)
         [ -n "$newpid" ] && break
         sleep 1; n=$((n + 1))
     done
@@ -136,12 +174,15 @@ cmd_up() {
     # shellcheck disable=SC2086
     systemctl --user reset-failed $UNITS 2>/dev/null || true
 
+    wait_for_update_check ||
+        die "agent-update.service still running after ${UPDATE_WAIT_SECS}s -- see journalctl --user -u agent-update.service, then re-run $0 up"
+
     # start, not restart: a running agent is left exactly as it is. If the unit
     # is down, ANY claude on the box -- a hand-started tmux agent or a human's
     # own interactive session -- makes agent-run.sh refuse (one per VM), so the
     # start would only burn StartLimitBurst and park the unit in `failed`.
     if ! systemctl --user is-active --quiet agent-claude.service &&
-        holder=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1) && [ -n "$holder" ]; then
+        holder=$(agent_pids | head -n 1) && [ -n "$holder" ]; then
         systemctl --user start agent-fsd.service agent-update.timer
         ps -o pid=,lstart=,args= -p "$holder" | cut -c1-120 || true
         log "NOT starting the agent: claude PID $holder already owns this box."
@@ -152,10 +193,10 @@ cmd_up() {
     systemctl --user start agent.target agent-update.timer
 
     n=0
-    while [ "$n" -lt 60 ] && ! pgrep -u "$(id -u)" -x claude >/dev/null 2>&1; do
+    while [ "$n" -lt 60 ] && [ -z "$(agent_pids)" ]; do
         sleep 1; n=$((n + 1))
     done
-    pgrep -u "$(id -u)" -x claude >/dev/null 2>&1 || {
+    [ -n "$(agent_pids)" ] || {
         systemctl --user status agent-claude.service --no-pager -n 20 2>&1 || true
         die "no claude after 60s"
     }
@@ -183,7 +224,7 @@ cmd_status() {
     # shellcheck disable=SC2086
     systemctl --user list-units --no-pager --all $UNITS 2>/dev/null | head -8 || true
     echo "--- agent ---"
-    pid=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1 || true)
+    pid=$(agent_pids | head -n 1)
     if [ -z "$pid" ]; then
         echo "no claude running"
     else

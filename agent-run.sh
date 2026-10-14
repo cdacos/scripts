@@ -28,8 +28,10 @@
 #      `--resume <id>`: no session id to track, and no need to guess which
 #      .jsonl is live from mtime -- a guess that `/clear` invalidates anyway,
 #      since it rotates the session id mid-life. With nothing to continue it
-#      starts a fresh session and exits 0 (verified on marvin 2026-08-27), so
-#      the fresh-box case needs no guard.
+#      prints "No conversation found to continue" and exits 1 (2.1.299, porky
+#      and marvin, 2026-10-14; on 2026-08-27 it still started fresh), so a
+#      fresh box restarts into StartLimitBurst and parks in `failed`. The guard
+#      is described at has_transcripts().
 #
 #      The in-flight tool call is still lost -- resume restores the
 #      conversation, not the interrupted `make`. Un-acked mail is safe by the
@@ -45,7 +47,8 @@
 #                       settings.json did not survive restarts: sessions came
 #                       back at the harness default (medium).
 #   AGENT_START_PROMPT  the opening turn
-#   AGENT_RESUME        1 = --continue the previous conversation (default 1)
+#   AGENT_RESUME        1 = --continue the previous conversation (default 1;
+#                       a box with no transcript at all starts fresh anyway)
 #   AGENT_UNIT          the systemd --user unit running this   (default: agent-claude.service)
 #
 # The opening turn also carries a few launch facts -- Claude Code version (and
@@ -78,20 +81,42 @@ AGENT_EFFORT="${AGENT_EFFORT-xhigh}"
 AGENT_RESUME="${AGENT_RESUME:-1}"
 AGENT_UNIT="${AGENT_UNIT:-agent-claude.service}"
 # One prompt for both paths. It has to read correctly on a resumed session AND
-# on a cold start, because --continue silently does the latter when there is
-# nothing to continue and the script cannot tell the two apart without
-# reimplementing the harness's transcript-path mangling.
+# on a cold start (AGENT_RESUME=0, or the first start on a fresh box).
 AGENT_START_PROMPT="${AGENT_START_PROMPT:-Supervisor start: systemd launched this session, not a human. If this is a resumed conversation, your previous turn was cut off mid-flight by a harness update -- that interruption is expected, not a fault, and any in-flight tool call is gone. Arm your agent-bus monitor now (agent-bus-cli.sh wake with Bash run_in_background, not the Monitor tool), handle any un-acked mail, then go idle. Acknowledge in one line.}"
 
 # --- one per VM ------------------------------------------------------------
 # A non-templated unit is already single-instance; this catches the other case,
 # a human starting a second claude by hand in a stray terminal.
-holder=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1 || true)
+#
+# `claude update` has the same name but is not an agent. agent-update.timer runs
+# it, and a restart that landed on it used to refuse five times in ~25s and park
+# the unit in `failed`. It is waited for (bounded), not refused: launching
+# mid-install would start the old build, which the same update check then finds
+# drifted and restarts.
+is_updater() {
+    [ "$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | sed -n 2p)" = update ]
+}
+holder='' updater=''
+for pid in $(pgrep -u "$(id -u)" -x claude 2>/dev/null || true); do
+    if is_updater "$pid"; then
+        updater="$updater $pid"
+    elif [ -z "$holder" ]; then
+        holder=$pid
+    fi
+done
 if [ -n "$holder" ]; then
     echo "agent-run: refusing to start -- claude already owns this box (PID $holder)" >&2
     ps -o pid=,lstart=,args= -p "$holder" >&2 || true
     exit 1
 fi
+n=0
+for pid in $updater; do
+    echo "agent-run: waiting for 'claude update' (PID $pid) to finish" >&2
+    while [ "$n" -lt 120 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        n=$((n + 1))
+    done
+done
 
 cd "$AGENT_WORKDIR" 2>/dev/null || cd "$HOME"
 
@@ -149,14 +174,39 @@ launch_facts() {
 }
 facts=$(launch_facts 2>/dev/null) || facts=
 
+# --- fresh box ---------------------------------------------------------------
+# `--continue` with nothing to continue exits 1 (see 4. above). The guard may
+# only be wrong in one direction. Calling a box with history fresh would start
+# a new conversation, which `--continue` then picks over the old one at every
+# later restart -- the agent's context wiped silently, on every harness update.
+# Missing a fresh box only costs a restart loop that ends in `failed`, which is
+# loud. So "fresh" means no transcript ANYWHERE, not none for this cwd: the
+# latter would re-derive the harness's project-dir naming, and a wrong guess
+# there is the silent direction. A box with history elsewhere but none here
+# still gets --continue and fails loudly. Anything find cannot answer counts
+# as history.
+has_transcripts() {
+    for _d in "$HOME/.claude/projects" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/projects"}; do
+        [ -e "$_d" ] || continue
+        _hit=$(find -H "$_d" -name '*.jsonl' -print -quit 2>/dev/null) || return 0
+        [ -z "$_hit" ] || return 0
+    done
+    return 1
+}
+
 # Word splitting on AGENT_CLAUDE_ARGS is deliberate: it is a flag list.
 # shellcheck disable=SC2086
 set -- claude $AGENT_CLAUDE_ARGS --remote-control "$AGENT_NAME"
 if [ -n "$AGENT_EFFORT" ]; then
     set -- "$@" --effort "$AGENT_EFFORT"
 fi
-if [ "$AGENT_RESUME" = 1 ]; then
+if [ "$AGENT_RESUME" != 1 ]; then
+    how="fresh session, AGENT_RESUME=$AGENT_RESUME"
+elif has_transcripts; then
+    how="resuming previous conversation"
     set -- "$@" --continue
+else
+    how="fresh session: no transcript on this box yet, nothing to --continue"
 fi
 # Appended rather than templated into the default, so a run.conf that replaces
 # AGENT_START_PROMPT still gets the facts.
@@ -168,9 +218,5 @@ else
     set -- "$@" "$AGENT_START_PROMPT"
 fi
 
-if [ "$AGENT_RESUME" = 1 ]; then
-    echo "agent-run: starting agent '$AGENT_NAME' in $(pwd) (resuming previous conversation)" >&2
-else
-    echo "agent-run: starting agent '$AGENT_NAME' in $(pwd) (fresh session, AGENT_RESUME=$AGENT_RESUME)" >&2
-fi
+echo "agent-run: starting agent '$AGENT_NAME' in $(pwd) ($how)" >&2
 exec "$@"

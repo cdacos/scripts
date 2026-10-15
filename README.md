@@ -140,9 +140,18 @@ Five things are worth knowing before adapting this:
   `--continue`, so a restart costs a repeated turn and one dead in-flight tool
   call — not the agent's context. This is what lets the idle gate be cheap: an
   accurate gate is only worth building if interrupting is expensive. With nothing
-  to continue, `claude --continue` exits 1, so a box with no transcript at all
-  under `~/.claude/projects` starts fresh instead; any other box still gets
-  `--continue`, and a mistake there shows as a restart loop, not a lost context.
+  to continue, `claude --continue` exits 1, so a cwd with provably no transcript
+  starts fresh instead: the first start on a box, or the first after
+  `AGENT_WORKDIR` moves. Proof is a search of the transcripts' own `"cwd"` field;
+  anything less still gets `--continue`, so a mistake shows as a restart loop,
+  not a lost context.
+* **A new `AGENT_WORKDIR` also re-arms the folder-trust prompt**, which
+  `--dangerously-skip-permissions` does not skip and which blocks the first turn
+  while every unit reads healthy. Trust is per exact path, so a trusted `~/src`
+  does not cover `~/src/umbrella`. Run `agent-supervision-install.sh status`
+  *before* restarting into a new workdir. `agent-run.sh` warns at launch too, but
+  the unit's journal is the TUI's byte stream, so read its lines with
+  `journalctl --user -t agent-run`.
 * **The idle gate is deliberately approximate, and deliberately small**: no
   un-acked bus mail, no transcript write for 120s, and no transcript *growth*
   during a 30s sample. Growth, not mtime — an idle session's `.jsonl` gets
@@ -166,7 +175,7 @@ Five things are worth knowing before adapting this:
 
 ```sh
 agent-supervision-install.sh            # linger, enable units, migrate the daemon
-agent-supervision-install.sh status     # what is running, and has it drifted?
+agent-supervision-install.sh status     # what is running, has it drifted, will the next start hit folder trust?
 agent-supervision-install.sh cutover    # hand a hand-started tmux agent to systemd
 agent-supervision-install.sh up         # after a reboot: start whatever is down, flag a stuck login
 ```

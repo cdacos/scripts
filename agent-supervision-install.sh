@@ -11,7 +11,8 @@
 #             failed unit, start agent.target, then check the session's screen
 #             for the prompts that block it invisibly (expired login, folder
 #             trust). Safe to re-run; never restarts a running agent.
-#   status    what is running, what version, and whether it has drifted.
+#   status    what is running, what version, whether it has drifted, and
+#             whether the next start will stop at the folder-trust prompt.
 #
 # The units and scripts themselves arrive via chezmoi externals; this only does
 # the parts chezmoi cannot (linger, daemon-reload, enable, the handover).
@@ -236,6 +237,42 @@ cmd_status() {
         echo "pid $pid  running $running  installed $installed  supervised=$supervised"
         [ "$running" = "$installed" ] || echo "DRIFT: a restart would move it to $installed"
     fi
+    echo "--- next start ---"
+    next_start
+}
+
+# Where agent-run.sh will start the agent, and whether claude will stop there at
+# its folder-trust prompt: trust is per exact path, so a new AGENT_WORKDIR arms
+# it again (porky, daffy, wile, 2026-10-15). Run status BEFORE restarting into a
+# new workdir; afterwards the only sign is a bus session that never appears.
+next_start() {
+    conf="${XDG_CONFIG_HOME:-$HOME/.config}/agent/run.conf"
+    # shellcheck disable=SC1090
+    wd=$(
+        [ ! -r "$conf" ] || . "$conf"
+        echo "${AGENT_WORKDIR:-$HOME/src}"
+    ) || wd=
+    if [ -z "$wd" ] || ! wdp=$(cd "$wd" 2>/dev/null && pwd -P); then
+        echo "workdir ${wd:-?} missing: agent-run.sh falls back to $HOME"
+        return 0
+    fi
+    trust=unknown
+    if command -v jq >/dev/null 2>&1; then
+        for f in "$HOME/.claude.json" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/.claude.json"}; do
+            [ -r "$f" ] || continue
+            rc=0
+            jq -e --arg a "$wd" --arg b "$wdp" \
+                '.projects[$a].hasTrustDialogAccepted == true or .projects[$b].hasTrustDialogAccepted == true' \
+                "$f" >/dev/null 2>&1 || rc=$?
+            case $rc in
+                0) trust=yes && break ;;
+                1) trust=NO ;;
+            esac
+        done
+    fi
+    echo "workdir $wd  trusted=$trust"
+    [ "$trust" != NO ] ||
+        echo "ACTION NEEDED: the next start will stop at the folder-trust prompt -- answer it in tmux -L agent attach"
 }
 
 case "${1:-install}" in

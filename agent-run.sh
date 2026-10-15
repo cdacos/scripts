@@ -30,8 +30,10 @@
 #      since it rotates the session id mid-life. With nothing to continue it
 #      prints "No conversation found to continue" and exits 1 (2.1.299, porky
 #      and marvin, 2026-10-14; on 2026-08-27 it still started fresh), so a
-#      fresh box restarts into StartLimitBurst and parks in `failed`. The guard
-#      is described at has_transcripts().
+#      fresh box restarts into StartLimitBurst and parks in `failed`. So does a
+#      box whose AGENT_WORKDIR just moved (porky, daffy, wile, 2026-10-15): it
+#      has history, just none in the new cwd. The guard is described at
+#      history_here().
 #
 #      The in-flight tool call is still lost -- resume restores the
 #      conversation, not the interrupted `make`. Un-acked mail is safe by the
@@ -48,7 +50,7 @@
 #                       back at the harness default (medium).
 #   AGENT_START_PROMPT  the opening turn
 #   AGENT_RESUME        1 = --continue the previous conversation (default 1;
-#                       a box with no transcript at all starts fresh anyway)
+#                       a cwd with provably no transcript starts fresh anyway)
 #   AGENT_UNIT          the systemd --user unit running this   (default: agent-claude.service)
 #
 # The opening turn also carries a few launch facts -- Claude Code version (and
@@ -81,8 +83,16 @@ AGENT_EFFORT="${AGENT_EFFORT-xhigh}"
 AGENT_RESUME="${AGENT_RESUME:-1}"
 AGENT_UNIT="${AGENT_UNIT:-agent-claude.service}"
 # One prompt for both paths. It has to read correctly on a resumed session AND
-# on a cold start (AGENT_RESUME=0, or the first start on a fresh box).
+# on a cold start (AGENT_RESUME=0, or the first start in a new AGENT_WORKDIR).
 AGENT_START_PROMPT="${AGENT_START_PROMPT:-Supervisor start: systemd launched this session, not a human. If this is a resumed conversation, your previous turn was cut off mid-flight by a harness update -- that interruption is expected, not a fault, and any in-flight tool call is gone. Arm your agent-bus monitor now (agent-bus-cli.sh wake with Bash run_in_background, not the Monitor tool), handle any un-acked mail, then go idle. Acknowledge in one line.}"
+
+# Say it twice: stderr for whoever is attached, and the journal under its own
+# tag. The unit's journal is the TUI's byte stream and claude repaints over
+# stderr at once, so only `journalctl --user -t agent-run` keeps these legible.
+say() {
+    echo "agent-run: $*" >&2
+    logger -t agent-run -- "$*" 2>/dev/null || true
+}
 
 # --- one per VM ------------------------------------------------------------
 # A non-templated unit is already single-instance; this catches the other case,
@@ -105,13 +115,13 @@ for pid in $(pgrep -u "$(id -u)" -x claude 2>/dev/null || true); do
     fi
 done
 if [ -n "$holder" ]; then
-    echo "agent-run: refusing to start -- claude already owns this box (PID $holder)" >&2
+    say "refusing to start -- claude already owns this box (PID $holder)"
     ps -o pid=,lstart=,args= -p "$holder" >&2 || true
     exit 1
 fi
 n=0
 for pid in $updater; do
-    echo "agent-run: waiting for 'claude update' (PID $pid) to finish" >&2
+    say "waiting for 'claude update' (PID $pid) to finish"
     while [ "$n" -lt 120 ] && kill -0 "$pid" 2>/dev/null; do
         sleep 1
         n=$((n + 1))
@@ -174,24 +184,64 @@ launch_facts() {
 }
 facts=$(launch_facts 2>/dev/null) || facts=
 
-# --- fresh box ---------------------------------------------------------------
-# `--continue` with nothing to continue exits 1 (see 4. above). The guard may
-# only be wrong in one direction. Calling a box with history fresh would start
-# a new conversation, which `--continue` then picks over the old one at every
-# later restart -- the agent's context wiped silently, on every harness update.
-# Missing a fresh box only costs a restart loop that ends in `failed`, which is
-# loud. So "fresh" means no transcript ANYWHERE, not none for this cwd: the
-# latter would re-derive the harness's project-dir naming, and a wrong guess
-# there is the silent direction. A box with history elsewhere but none here
-# still gets --continue and fails loudly. Anything find cannot answer counts
-# as history.
-has_transcripts() {
+# --- nothing to continue -----------------------------------------------------
+# `--continue` with nothing to continue in the cwd exits 1 (see 4. above). The
+# guard may only be wrong in one direction. Calling a cwd with history fresh
+# would start a new conversation, which `--continue` then picks over the old
+# one at every later restart -- the agent's context wiped silently, on every
+# harness update. Missing a fresh cwd only costs a restart loop that ends in
+# `failed`, which is loud. So "nothing here" needs proof, and anything short
+# of proof counts as history:
+#   - Claude Code writes the session's cwd into every transcript line as
+#     "cwd":"<path>". Search for that, not for the harness's project-dir name:
+#     re-deriving that naming is a guess, and a wrong guess is the silent
+#     direction. Both spellings of the cwd, in case a symlink is recorded
+#     resolved.
+#   - The newest non-empty transcript must still carry the field. If the
+#     format moves, the search would miss everything, every time.
+#   - A path with a quote or backslash is escaped in JSON, so a literal search
+#     proves nothing.
+#   - grep must answer "no match" (1). An error (2) is not an answer.
+# No transcript at all is the fresh box, and needs none of this.
+history_here() {
+    case "$1$2" in *'"'* | *\\*) return 0 ;; esac
     for _d in "$HOME/.claude/projects" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/projects"}; do
         [ -e "$_d" ] || continue
-        _hit=$(find -H "$_d" -name '*.jsonl' -print -quit 2>/dev/null) || return 0
-        [ -z "$_hit" ] || return 0
+        _all=$(find -H "$_d" -name '*.jsonl' -size +0 -printf '%T@ %p\n' 2>/dev/null) || return 0
+        [ -n "$_all" ] || continue
+        _new=$(printf '%s\n' "$_all" | sort -rn | head -n 1 | cut -d' ' -f2-)
+        grep -q '"cwd":"' "$_new" 2>/dev/null || return 0
+        _rc=0
+        grep -rqF --include='*.jsonl' -e "\"cwd\":\"$1\"" -e "\"cwd\":\"$2\"" "$_d" 2>/dev/null || _rc=$?
+        [ "$_rc" = 1 ] || return 0
     done
     return 1
+}
+
+# --- folder trust ------------------------------------------------------------
+# Before the first turn in a folder that ~/.claude.json does not record as
+# trusted, Claude Code asks "Do you trust the files in this folder?", and
+# --dangerously-skip-permissions does not skip it. Under systemd that hangs the
+# start invisibly: the unit is active, and no bus session ever appears. Trust
+# is per exact path, never inherited from a parent, so moving AGENT_WORKDIR
+# arms it again. Answering is a person's call, so this only warns, and only on
+# a definite no: no jq, no file, or a file jq cannot read says nothing.
+untrusted() {
+    command -v jq >/dev/null 2>&1 || return 1
+    _seen=
+    for _f in "$HOME/.claude.json" ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR/.claude.json"}; do
+        [ -r "$_f" ] || continue
+        _rc=0
+        jq -e --arg a "$1" --arg b "$2" \
+            '.projects[$a].hasTrustDialogAccepted == true or .projects[$b].hasTrustDialogAccepted == true' \
+            "$_f" >/dev/null 2>&1 || _rc=$?
+        case $_rc in
+            0) return 1 ;;
+            1) _seen=1 ;;
+            *) return 1 ;;
+        esac
+    done
+    [ -n "$_seen" ]
 }
 
 # Word splitting on AGENT_CLAUDE_ARGS is deliberate: it is a flag list.
@@ -202,11 +252,11 @@ if [ -n "$AGENT_EFFORT" ]; then
 fi
 if [ "$AGENT_RESUME" != 1 ]; then
     how="fresh session, AGENT_RESUME=$AGENT_RESUME"
-elif has_transcripts; then
+elif history_here "$(pwd)" "$(pwd -P)"; then
     how="resuming previous conversation"
     set -- "$@" --continue
 else
-    how="fresh session: no transcript on this box yet, nothing to --continue"
+    how="fresh session: no transcript for this cwd, nothing to --continue"
 fi
 # Appended rather than templated into the default, so a run.conf that replaces
 # AGENT_START_PROMPT still gets the facts.
@@ -218,5 +268,8 @@ else
     set -- "$@" "$AGENT_START_PROMPT"
 fi
 
-echo "agent-run: starting agent '$AGENT_NAME' in $(pwd) ($how)" >&2
+say "starting agent '$AGENT_NAME' in $(pwd) ($how)"
+if untrusted "$(pwd)" "$(pwd -P)"; then
+    say "WARNING $(pwd) is not a trusted folder: claude will stop at its trust prompt before the first turn. Answer it in: tmux -L agent attach"
+fi
 exec "$@"

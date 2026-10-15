@@ -87,6 +87,14 @@ state *changes* are posted: idle after 5 minutes out of a turn
 (`AGENT_STATUS_IDLE_AFTER`), working on the way out of idle, so a run of quick
 turns costs nothing in the bus's permanent history.
 
+Each post also names the feature branch the box is on, which the Fleet card
+links to in the Files tab. That branch is found from git, not from the session,
+because the session's working directory stays at the workdir. The CLI looks at
+every worktree of every repo directly under `AGENT_BUS_FS_ROOT`. It picks the
+worktree on a non-default branch whose index, HEAD or reflog changed most
+recently, within `AGENT_STATUS_BRANCH_WINDOW` (24 h). `wake` checks between
+polls and posts again only when the answer changes.
+
 ### `agent-bus-fsd.sh`
 
 Serves this box's `~/src` to the **agent-bus** web UI's Files tab. The bus runs
@@ -101,7 +109,10 @@ Gitignored files and `.git` directories are withheld by default
 guarding: anything committed is already on the remote, whereas gitignored files
 are where secrets live by convention — and a `.git` pack still holds secrets
 that were committed and later deleted. `.gitignore` itself stays readable.
-Tracked contents are otherwise served raw, so point `AGENT_BUS_FS_ROOT` only at
+There is one exception: the root of a linked worktree of the repo that ignores
+its folder, such as `.claude/worktrees/<name>`. Its contents are that repo's
+own files on another branch, so the root is served and its own `.gitignore`
+governs what lies beneath it. Tracked contents are otherwise served raw, so point `AGENT_BUS_FS_ROOT` only at
 a tree you would hand to every agent on the bus.
 
 It also answers **search** (`fs.grep`), using ripgrep when a real `rg` binary is

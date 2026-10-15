@@ -66,7 +66,10 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   from `wake`'s empty polls once a turn has been over `AGENT_STATUS_IDLE_AFTER` (300 s), working
   on leaving a posted idle. Hook paths stay silent (UserPromptSubmit stdout becomes model context)
   and post from a detached child **pinned to the session key** — it outlives the hook's shell, so
-  an ancestry walk would find no `claude` and an unseen key meets the 409.
+  an ancestry walk would find no `claude` and an unseen key meets the 409. Each post also carries
+  `branch`/`branch_path`. These come from git, not from the session's cwd, which stays at the
+  workdir. The CLI takes the most recently active worktree on a non-default branch under the
+  served root, within 24 h. `wake`'s tick posts again only when that changes.
 - **`onboard`** prints the session-start briefing (the SessionStart hook's output). It is read by
   every agent at every `/clear`, so keep it short and imperative.
 
@@ -98,7 +101,10 @@ exists for it**.
 - **Gitignored files and `.git` are withheld** (`AGENT_BUS_FS_GITIGNORE`, default on). That is
   the only layer browsing exposes beyond what pushing already does, and `.git` packs hold deleted
   secrets. Checked at listing time and again on read. Any token may browse; there is no per-agent
-  ACL.
+  ACL. The one exception is the root of a linked worktree of the very repo that ignores its folder
+  (`.claude/worktrees/<name>`). Its content is that repo's own, so it is served, and the
+  worktree's own `.gitignore` applies inside it. A foreign clone or vendored `.git` under an
+  ignored folder stays withheld.
 - **Fail closed:** with the flag on and no `git`, the daemon refuses to start.
 - Search (`fs.grep`) is advertised through `ops` on `fs.ping`. Its engine must be a real binary:
   `command -v rg` can be satisfied by a shell function.

@@ -75,7 +75,10 @@ What is NOT served, unless AGENT_BUS_FS_GITIGNORE=0:
   - anything a repo's .gitignore covers. That is where secrets live by
     convention, and it is the one layer a browser would expose that pushing to
     a remote would not. The repo's own declaration of what it will not share is
-    a better rule than any pattern list this script could guess.
+    a better rule than any pattern list this script could guess. Except the
+    root of a linked worktree of that same repo (.claude/worktrees/<name>):
+    its content is the repo's own, on another branch, so it is served and
+    its own .gitignore applies inside it.
   - .git directories, which hold every version of every tracked file --
     including a secret that was committed and later deleted. Withholding
     .gitignore'd files while serving .git would be theatre.
@@ -354,6 +357,17 @@ path_excluded() {
             return 0
             ;;
     esac
+    # A linked worktree of the very repo whose .gitignore hides its folder --
+    # Claude Code puts them under .claude/worktrees/, which repos ignore -- is
+    # that repo's own content on another branch, not the untracked layer this
+    # rule protects. Serve its root; inside it, its own .gitignore applies as
+    # anywhere else. Only a worktree of THAT repo: a stray clone or a vendored
+    # package's .git under an ignored folder stays withheld.
+    if [ -f "$1/.git" ]; then
+        _wt_c=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || _wt_c=''
+        _wt_p=$(git -C "$(dirname -- "$1")" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || _wt_p=''
+        [ -n "$_wt_c" ] && [ "$_wt_c" = "$_wt_p" ] && return 1
+    fi
     # A file nested inside an ignored directory is reported ignored too, so this
     # one call covers node_modules/foo/bar as well as a named file.
     if printf '%s\n' "$(basename -- "$1")" |

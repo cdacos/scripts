@@ -767,12 +767,21 @@ status_publish() {
     else
         _pb_body="status $_pb_name $2"
     fi
+    # The caller may pass the branch it has just scanned, so a check that found a
+    # change does not pay for a second scan. Unset means "look it up".
+    _pb_git=${4-$(status_branch)}
+    _pb_branch=$(printf '%s' "$_pb_git" | cut -f1)
+    _pb_bpath=$(printf '%s' "$_pb_git" | cut -s -f2)
+    [ -n "$_pb_branch" ] && _pb_body="$_pb_body [on $_pb_branch]"
     _pb_meta=$(jq -n --arg s "$_pb_name" --arg st "$2" --arg since "$(epoch_iso "$3")" \
         --arg t "$_pb_task" --arg ta "$_pb_task_at" --arg h "$(bus_hostname)" \
-        '{kind:"status", session:$s, state:$st, since:$since, task:$t, task_at:$ta, host:$h}')
+        --arg b "$_pb_branch" --arg bp "$_pb_bpath" \
+        '{kind:"status", session:$s, state:$st, since:$since, task:$t, task_at:$ta, host:$h,
+          branch:$b, branch_path:$bp}')
     _pb_rc=1
     if api POST "/topics/$AGENT_STATUS_TOPIC" -d "$(payload "$_pb_body" "$_pb_meta")" >/dev/null 2>&1; then
         status_put "$1/posted" "$2 $3"
+        status_put "$1/branch" "$_pb_git"
         _pb_rc=0
     fi
     bus_conflict_handled
@@ -825,6 +834,95 @@ status_idle_check() {
     case "$_ic_at" in '' | *[!0-9]*) return 0 ;; esac
     [ $(($(date -u +%s) - _ic_at)) -ge "$STATUS_IDLE_AFTER" ] || return 0
     status_publish "$_ic_dir" idle "$_ic_at" || true
+}
+
+# --- branch: the feature branch this box is working on, for the Fleet card.
+# The session's cwd cannot say: the harness keeps it at the workdir and agents
+# work by absolute path. git can. Of every worktree of every repo directly under
+# the served root, take the one on a non-default branch whose git state (index,
+# HEAD, reflog) moved most recently, if within STATUS_BRANCH_WINDOW. One agent
+# per box, so the box's answer is the agent's. A branch is not secret, but the
+# path is logical (as the Files tab names it), never an absolute one.
+STATUS_BRANCH_WINDOW="${AGENT_STATUS_BRANCH_WINDOW:-86400}"
+STATUS_FS_ROOT="${AGENT_BUS_FS_ROOT:-$HOME/src}"
+
+# status_branch -> "<branch>TAB<logical path>", or nothing when no feature
+# branch is in use. The path is empty when the worktree lies outside the root.
+status_branch() {
+    command -v git >/dev/null 2>&1 || return 0
+    [ -d "$STATUS_FS_ROOT" ] || return 0
+    _sb_tab=$(printf '\t')
+    _sb_now=$(date -u +%s)
+    # Every worktree is listed once per repo it belongs to; sort -u folds a
+    # repo reached through two children (a worktree at ~/src/x-wt) into one.
+    _sb_best=$(
+        for _sb_d in "$STATUS_FS_ROOT"/*; do
+            [ -e "$_sb_d/.git" ] && git -C "$_sb_d" worktree list --porcelain 2>/dev/null
+        done |
+            awk '/^worktree /{wt=substr($0,10)} /^branch refs\/heads\//{print substr($0,19) "\t" wt}' |
+            sort -u |
+            while IFS="$_sb_tab" read -r _sb_br _sb_wt; do
+                case "$_sb_br" in main | master) continue ;; esac
+                _sb_def=$(git -C "$_sb_wt" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) || _sb_def=''
+                [ "$_sb_br" = "${_sb_def#origin/}" ] && continue
+                _sb_gd=$(git -C "$_sb_wt" rev-parse --absolute-git-dir 2>/dev/null) || continue
+                _sb_t=0
+                for _sb_f in "$_sb_gd/index" "$_sb_gd/HEAD" "$_sb_gd/logs/HEAD"; do
+                    [ -e "$_sb_f" ] || continue
+                    _sb_m=$(mtime_epoch "$_sb_f")
+                    [ "$_sb_m" -gt "$_sb_t" ] && _sb_t=$_sb_m
+                done
+                [ $((_sb_now - _sb_t)) -le "$STATUS_BRANCH_WINDOW" ] || continue
+                printf '%s\t%s\t%s\n' "$_sb_t" "$_sb_br" "$_sb_wt"
+            done | sort -rn | head -n 1
+    )
+    [ -n "$_sb_best" ] || return 0
+    printf '%s\t%s\n' "$(printf '%s' "$_sb_best" | cut -f2)" \
+        "$(status_logical "$(printf '%s' "$_sb_best" | cut -f3-)")"
+}
+
+# status_logical <abs path> -> the path as the Files tab names it, or nothing
+# when the served root does not reach it. Same prefixes as agent-bus-fsd.sh's
+# logical_roots: the root, then each symlinked direct child, so a deliberate
+# link such as dotfiles -> ~/.local/share/chezmoi resolves too.
+status_logical() {
+    _lg_root=$(cd -P "$STATUS_FS_ROOT" 2>/dev/null && pwd) || return 0
+    case "$1" in
+        "$_lg_root"/*)
+            printf '%s\n' "${1#"$_lg_root"/}"
+            return 0
+            ;;
+    esac
+    for _lg_c in "$STATUS_FS_ROOT"/*; do
+        [ -L "$_lg_c" ] || continue
+        _lg_r=$(cd -P "$_lg_c" 2>/dev/null && pwd) || continue
+        case "$1" in
+            "$_lg_r")
+                printf '%s\n' "${_lg_c##*/}"
+                return 0
+                ;;
+            "$_lg_r"/*)
+                printf '%s/%s\n' "${_lg_c##*/}" "${1#"$_lg_r"/}"
+                return 0
+                ;;
+        esac
+    done
+    return 0
+}
+
+# status_branch_check -- called by `wake` between polls, beside the idle check:
+# when the branch differs from what the bus last heard, re-post the same state
+# and start time with the new branch. Only a change costs a post.
+status_branch_check() {
+    _bc_dir=$(status_dir)
+    [ -n "$_bc_dir" ] || return 0
+    _bc_state=$(status_field "$_bc_dir/posted" 1)
+    _bc_since=$(status_field "$_bc_dir/posted" 2)
+    case "$_bc_state" in working | idle) ;; *) return 0 ;; esac
+    case "$_bc_since" in '' | *[!0-9]*) return 0 ;; esac
+    _bc_git=$(status_branch)
+    [ "$_bc_git" = "$(cat "$_bc_dir/branch" 2>/dev/null)" ] && return 0
+    status_publish "$_bc_dir" "$_bc_state" "$_bc_since" "$_bc_git" || true
 }
 
 # status_prune -- drop state left by sessions that are provably gone (the same
@@ -1154,6 +1252,7 @@ case "$cmd" in
             if [ "${count:-0}" -eq 0 ]; then
                 # An empty poll is the one regular tick an idle session has.
                 status_idle_check
+                status_branch_check
                 continue
             fi
             # Mail is about to start a turn, and it reaches the agent as a

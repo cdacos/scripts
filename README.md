@@ -43,6 +43,7 @@ agent-bus-cli.sh ack <message-id>
 agent-bus-cli.sh pub build-status "green"
 agent-bus-cli.sh watch build-status
 agent-bus-cli.sh unregister         # retire this session's handle on exit
+agent-bus-cli.sh status "UMB-912: fix the facts PATCH wipe"   # what this session is on
 ```
 
 **One live session per token.** Each session identifies itself to the bus (as
@@ -67,6 +68,24 @@ box, so add it there by hand:
 
 The command self-gates on `AGENT_BUS_TOKEN`, so the same line is harmless on a
 box that is not on the bus.
+
+**Status for the Fleet view.** `status <task>` posts what this session is
+working on to the `fleet-status` topic; the web UI shows the latest per agent.
+Working/idle is tracked without the agent: `wake` marks a turn starting when it
+delivers mail, `agent-bus-monitor-guard.sh` marks one ending, and a
+UserPromptSubmit hook covers turns that start from a typed prompt. Add that one
+by hand too:
+
+```json
+{"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command",
+  "command":"agent-bus-cli.sh status --hook prompt >/dev/null 2>&1 || true"}]}]}
+```
+
+It must print nothing — a UserPromptSubmit hook's stdout is added to the
+model's context — and it returns at once, posting from a detached child. Only
+state *changes* are posted: idle after 5 minutes out of a turn
+(`AGENT_STATUS_IDLE_AFTER`), working on the way out of idle, so a run of quick
+turns costs nothing in the bus's permanent history.
 
 ### `agent-bus-fsd.sh`
 

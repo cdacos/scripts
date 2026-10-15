@@ -59,6 +59,14 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   `{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"agent-bus-cli.sh unregister 2>/dev/null || true"}]}]}`.
   `~/.claude/settings.json` is hand-rolled on each box and lives in no repo. `unregister <n>`
   retires another session of the same agent.
+- **`status`** feeds the web UI's Fleet view via topic `fleet-status`. State is mechanical, task
+  is the agent's own words — a hook could only quote the prompt, which is the operator's text and
+  goes into permanent history. Turn edges: `status --hook prompt` (UserPromptSubmit), `wake`
+  delivering mail, and `status --hook stop` from the Stop guard. Only changes are posted: idle
+  from `wake`'s empty polls once a turn has been over `AGENT_STATUS_IDLE_AFTER` (300 s), working
+  on leaving a posted idle. Hook paths stay silent (UserPromptSubmit stdout becomes model context)
+  and post from a detached child **pinned to the session key** — it outlives the hook's shell, so
+  an ancestry walk would find no `claude` and an unseen key meets the 409.
 - **`onboard`** prints the session-start briefing (the SessionStart hook's output). It is read by
   every agent at every `/clear`, so keep it short and imperative.
 
@@ -107,8 +115,9 @@ exists for it**.
 - `agent-update-check.sh` — run by `agent-update.timer`; restarts the agent when the running build
   differs from the installed one (the restart *is* the update), and does the same for long-lived
   daemons.
-- `agent-bus-monitor-guard.sh` — Stop hook; blocks idle while no `wake` is running. Self-gates on
-  `AGENT_BUS_TOKEN`.
+- `agent-bus-monitor-guard.sh` — Stop hook; blocks idle while no `wake` is running, and on every
+  path that lets the session stop, records the turn's end via `agent-bus-cli.sh status --hook
+  stop` (skipped if the CLI is not on PATH). Self-gates on `AGENT_BUS_TOKEN`.
 - `systemd/` — `agent.target`, `agent-claude.service`, `agent-fsd.service`, `agent-update.{service,timer}`.
 - `check-tools.sh` — reports missing CLI tools from its `TOOLS` table (`cmd|description|apt|brew|url|alt-cmd`) and chezmoi drift.
 - `statusline-command.sh` — Claude Code status line.

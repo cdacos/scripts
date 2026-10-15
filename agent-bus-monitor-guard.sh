@@ -16,10 +16,22 @@
 
 input=$(cat 2>/dev/null)
 
+# record_stop -- the turn is over: tell agent-bus-cli.sh's status tracking,
+# which posts idle to the fleet only if no turn follows within a few minutes.
+# Called on every path that lets the session stop, never on the one that blocks
+# it (a blocked stop is the same turn carrying on). Optional by design: this
+# script stays standalone, and without the CLI there is no status to keep.
+record_stop() {
+    command -v agent-bus-cli.sh >/dev/null 2>&1 || return 0
+    agent-bus-cli.sh status --hook stop </dev/null >/dev/null 2>&1 || true
+}
 # If we already blocked once this turn, relent -- Claude Code caps consecutive
 # Stop-hook blocks, and we never want to trap the agent.
 case "$input" in
-    *'"stop_hook_active":true'* | *'"stop_hook_active": true'*) exit 0 ;;
+    *'"stop_hook_active":true'* | *'"stop_hook_active": true'*)
+        record_stop
+        exit 0
+        ;;
 esac
 
 # supervisor_pid -> the `claude` session that owns this hook invocation. Walk
@@ -104,6 +116,7 @@ monitor_armed() {
 
 # Monitor already armed -> fine to stop.
 if monitor_armed; then
+    record_stop
     exit 0
 fi
 

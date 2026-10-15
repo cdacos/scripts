@@ -81,6 +81,12 @@ Commands:
   status --hook prompt|stop   For Claude Code hooks: a turn started (UserPromptSubmit)
                               or ended (Stop). Silent, returns at once, and costs no
                               post unless the state actually changed.
+  status --hook waiting <kind> For Claude Code hooks: the session is now waiting on
+                              the operator -- notified (PostToolUse PushNotification),
+                              permission (Notification permission_prompt) or question
+                              (PreToolUse AskUserQuestion). The operator's next prompt
+                              clears it; `--hook answered` (PostToolUse, any tool)
+                              clears permission/question, as does the turn ending.
   docs                        Show the server's usage documentation
   -h, --help                  Show this help
 
@@ -704,6 +710,8 @@ emit_heartbeat() {
 #   posted  "working <epoch>" | "idle <epoch>" -- what the bus last heard
 #   task    the current task text; its mtime is when it was set
 #   name    this session's display handle (Marvin-71), cached from /whoami
+#   waiting "<kind> <epoch>" -- the session is waiting on the operator (see
+#           status_mark_waiting); absent otherwise
 AGENT_STATUS="${AGENT_STATUS:-1}"
 AGENT_STATUS_TOPIC="${AGENT_STATUS_TOPIC:-fleet-status}"
 STATUS_IDLE_AFTER="${AGENT_STATUS_IDLE_AFTER:-300}"
@@ -773,11 +781,18 @@ status_publish() {
     _pb_branch=$(printf '%s' "$_pb_git" | cut -f1)
     _pb_bpath=$(printf '%s' "$_pb_git" | cut -s -f2)
     [ -n "$_pb_branch" ] && _pb_body="$_pb_body [on $_pb_branch]"
+    _pb_wait=$(status_field "$1/waiting" 1)
+    _pb_wait_at=''
+    if [ -n "$_pb_wait" ]; then
+        _pb_wait_at=$(epoch_iso "$(status_field "$1/waiting" 2)")
+        _pb_body="$_pb_body (waiting on operator: $_pb_wait)"
+    fi
     _pb_meta=$(jq -n --arg s "$_pb_name" --arg st "$2" --arg since "$(epoch_iso "$3")" \
         --arg t "$_pb_task" --arg ta "$_pb_task_at" --arg h "$(bus_hostname)" \
-        --arg b "$_pb_branch" --arg bp "$_pb_bpath" \
+        --arg b "$_pb_branch" --arg bp "$_pb_bpath" --arg w "$_pb_wait" --arg wa "$_pb_wait_at" \
         '{kind:"status", session:$s, state:$st, since:$since, task:$t, task_at:$ta, host:$h,
-          branch:$b, branch_path:$bp}')
+          branch:$b, branch_path:$bp}
+         + if $w == "" then {} else {waiting:$w, waiting_since:$wa} end')
     _pb_rc=1
     if api POST "/topics/$AGENT_STATUS_TOPIC" -d "$(payload "$_pb_body" "$_pb_meta")" >/dev/null 2>&1; then
         status_put "$1/posted" "$2 $3"
@@ -798,20 +813,74 @@ status_post_async() {
         </dev/null >/dev/null 2>&1 &
 }
 
-# status_mark_active [async] -- a turn has started. Posts working only when the
-# bus last heard idle (or nothing), so consecutive turns cost nothing.
+# status_mark_active [async] [force] -- a turn has started. Posts working only
+# when the bus last heard idle (or nothing), so consecutive turns cost nothing;
+# force posts anyway (a waiting flag just dropped), keeping a working start.
 status_mark_active() {
     _ma_dir=$(status_dir)
     [ -n "$_ma_dir" ] || return 0
     mkdir -p "$_ma_dir" 2>/dev/null || return 0
     _ma_now=$(date -u +%s)
     status_put "$_ma_dir/turn" "active $_ma_now"
-    [ "$(status_field "$_ma_dir/posted" 1)" = working ] && return 0
-    if [ "${1:-}" = async ]; then
-        status_post_async working "$_ma_now"
-    else
-        status_publish "$_ma_dir" working "$_ma_now" || true
+    _ma_since=$_ma_now
+    if [ "$(status_field "$_ma_dir/posted" 1)" = working ]; then
+        [ "${2:-}" = force ] || return 0
+        _ma_since=$(status_field "$_ma_dir/posted" 2)
+        case "$_ma_since" in '' | *[!0-9]*) _ma_since=$_ma_now ;; esac
     fi
+    if [ "${1:-}" = async ]; then
+        status_post_async working "$_ma_since"
+    else
+        status_publish "$_ma_dir" working "$_ma_since" || true
+    fi
+}
+
+# --- waiting: the session is waiting on the operator, for the Fleet card. Set
+# by hooks on things only the operator can answer. Kinds:
+#   notified    a PushNotification went out (PostToolUse). Cleared only by the
+#               operator's next prompt or a /clear, which only they can type.
+#   permission  a permission prompt has gone unanswered for a few seconds
+#               (Notification permission_prompt).
+#   question    AskUserQuestion is up (PreToolUse).
+# The last two block the turn, so they also clear once any tool completes or
+# the turn ends: no hook fires on approving a prompt, but the next tool does.
+# Mail from another agent is not an answer, though it reaches the session as a
+# prompt; see `status --hook prompt`. One post per change, so a notification
+# costs two: set and cleared.
+
+# status_mark_waiting <kind> -- set the flag, posting only if it changed.
+# Keeps the original time across a repeat of the same kind.
+status_mark_waiting() {
+    _mw_dir=$(status_dir)
+    [ -n "$_mw_dir" ] || return 0
+    case "$1" in notified | permission | question) ;; *) return 0 ;; esac
+    mkdir -p "$_mw_dir" 2>/dev/null || return 0
+    [ "$(status_field "$_mw_dir/waiting" 1)" = "$1" ] && return 0
+    status_put "$_mw_dir/waiting" "$1 $(date -u +%s)"
+    status_repost_async "$_mw_dir"
+}
+
+# status_unwait [blocked] -- drop the flag, or with `blocked` only a kind that
+# blocks the turn. Local only; 0 when there was one to drop, so the caller
+# knows a post is owed.
+status_unwait() {
+    _uw_dir=$(status_dir)
+    [ -n "$_uw_dir" ] && [ -e "$_uw_dir/waiting" ] || return 1
+    if [ "${1:-}" = blocked ]; then
+        case "$(status_field "$_uw_dir/waiting" 1)" in permission | question) ;; *) return 1 ;; esac
+    fi
+    rm -f "$_uw_dir/waiting" 2>/dev/null
+}
+
+# status_repost_async <dir> -- post what the bus last heard again, so a change
+# outside working/idle (the waiting flag) reaches it. A session that has never
+# posted is in a turn, or a hook would not be running.
+status_repost_async() {
+    _ra_state=$(status_field "$1/posted" 1)
+    _ra_since=$(status_field "$1/posted" 2)
+    case "$_ra_state" in working | idle) ;; *) _ra_state=working ;; esac
+    case "$_ra_since" in '' | *[!0-9]*) _ra_since=$(date -u +%s) ;; esac
+    status_post_async "$_ra_state" "$_ra_since"
 }
 
 # status_mark_stop -- a turn has ended. Local only; idle is posted later, by
@@ -821,6 +890,7 @@ status_mark_stop() {
     [ -n "$_ms_dir" ] || return 0
     mkdir -p "$_ms_dir" 2>/dev/null || return 0
     status_put "$_ms_dir/turn" "stop $(date -u +%s)"
+    if status_unwait blocked; then status_repost_async "$_ms_dir"; fi
 }
 
 # status_idle_check -- called by `wake` between polls: post idle once the last
@@ -1056,6 +1126,9 @@ case "$cmd" in
         printf '\n%s\n' 'KNOWN MONITOR DEATHS - re-arm silently, once per death, with no commentary, no counting and no memory diagnostics. The output file cannot tell them apart - `[killed]` is what the harness writes for ANY task it stops - so go by the notification text. (1) "stopped because the system is running low on memory": the harness'"'"'s idle-session reap, set off by a kernel PSI trigger that fires with no real memory shortage. agent-claude.service turns it off (CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1), so it is expected only in a session started some other way. (2) `Terminated` / exit 143 immediately after a /clear: this briefing retired the previous context'"'"'s monitor on purpose so two wakes do not race. (3) "Monitor expired": the wake was armed with the Monitor tool - re-arm it with Bash as above. (4) "stopped after reaching its background time limit": the wake hit the harness'"'"'s background deadline (new in 2.1.285) - re-arm it as above with the `timeout`, and ignore the notification'"'"'s advice not to restart; agent-claude.service sets BASH_MAX_TIMEOUT_MS so the ceiling is ~24.8 days, elsewhere it is 2h. None of these loses mail, because un-acked mail is re-delivered. `agent-bus-cli.sh search "pressure reap"` has the analysis.'
         printf '\n%s\n' 'STATUS: the bus web UI'"'"'s Fleet view shows what each agent is working on. When you start a distinct piece of work (a new request or issue, not each step), set it in one line, in the same step as your other tool calls: `agent-bus-cli.sh status "UMB-912: fix the facts PATCH wipe"`. Max 120 characters; topics are permanent and readable by every agent, so no secrets or pasted content. `agent-bus-cli.sh status --clear` when done. Hooks track working/idle for you.'
         status_prune
+        # Only the operator types /clear, so it answers whatever we were
+        # waiting on them for.
+        status_unwait && status_repost_async "$(status_dir)"
         # Absence of this post is the fleet-visible signal; see emit_heartbeat.
         emit_heartbeat
         # One sentence, and only when the bus actually refused us -- which the
@@ -1085,10 +1158,34 @@ case "$cmd" in
                 # on the token like onboard, so the hook line can be unconditional.
                 [ -n "${AGENT_BUS_TOKEN:-}" ] && [ -n "${AGENT_BUS_URL:-}" ] || exit 0
                 command -v jq >/dev/null 2>&1 || exit 0
+                # `answered` runs after every tool call, so it must cost next to
+                # nothing unless a session on this box is blocked on the operator:
+                # finding our own session key walks the process tree.
+                if [ "${2:-}" = answered ]; then
+                    grep -qsE '^(permission|question) ' "$STATUS_ROOT"/*/waiting || exit 0
+                fi
                 require_env
                 case "${2:-}" in
-                    prompt) status_mark_active async ;;
+                    prompt)
+                        # UserPromptSubmit also fires when a background task
+                        # finishes -- `wake` delivering mail among them -- with the
+                        # harness's notification as the prompt. Only a prompt
+                        # from the operator answers them. The prompt is read
+                        # here and never leaves this process.
+                        _st_from=''
+                        [ -t 0 ] || _st_from=$(jq -r '.prompt // "" | .[0:19]' 2>/dev/null) || _st_from=''
+                        if [ "$_st_from" != '<task-notification>' ] && status_unwait; then
+                            status_mark_active async force
+                        else
+                            status_mark_active async
+                        fi
+                        ;;
                     stop) status_mark_stop ;;
+                    waiting) status_mark_waiting "${3:-}" ;;
+                    answered)
+                        _st_dir=$(status_dir)
+                        if status_unwait blocked; then status_repost_async "$_st_dir"; fi
+                        ;;
                 esac
                 exit 0
                 ;;

@@ -70,6 +70,15 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   `branch`/`branch_path`. These come from git, not from the session's cwd, which stays at the
   workdir. The CLI takes the most recently active worktree on a non-default branch under the
   served root, within 24 h. `wake`'s tick posts again only when that changes.
+- **Waiting on the operator** rides the same posts as `meta.waiting` (`notified`, `permission`,
+  `question`) + `waiting_since`, set by `status --hook waiting <kind>` from PostToolUse
+  `PushNotification`, Notification `permission_prompt` and PreToolUse `AskUserQuestion`. Only the
+  operator clears `notified`: their next prompt or a `/clear`. **UserPromptSubmit also fires when
+  a background task finishes** (`wake` delivering mail among them, verified on 2.1.300) with a
+  prompt starting `<task-notification>`, so the prompt hook reads it, never forwards it, and does
+  not count it as an answer. No hook fires on approving a permission prompt, so `permission` and
+  `question` also clear on the next PostToolUse of any tool (`--hook answered`, which greps the
+  local state and exits before the process-tree walk unless something is blocked) and at Stop.
 - **`onboard`** prints the session-start briefing (the SessionStart hook's output). It is read by
   every agent at every `/clear`, so keep it short and imperative.
 

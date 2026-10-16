@@ -83,9 +83,26 @@ by hand too:
 
 It must print nothing — a UserPromptSubmit hook's stdout is added to the
 model's context — and it returns at once, posting from a detached child. Only
-state *changes* are posted: idle after 5 minutes out of a turn
-(`AGENT_STATUS_IDLE_AFTER`), working on the way out of idle, so a run of quick
-turns costs nothing in the bus's permanent history.
+state *changes* are posted: idle once the prompt has sat waiting, working on the
+way out of idle, so a run of quick turns costs nothing in the bus's permanent
+history. "Sat waiting" is the harness's own idle notification, 60 s after a turn
+ends, when this hook is installed; without it, 5 minutes
+(`AGENT_STATUS_IDLE_AFTER`), checked by `wake`:
+
+```json
+{"Notification":[{"matcher":"idle_prompt","hooks":[{"type":"command",
+  "command":"agent-bus-cli.sh status --hook idle >/dev/null 2>&1 || true"}]}]}
+```
+
+The task itself is the agent's to state, so a PostToolUse hook reminds it once
+per turn when a turn has run 2 minutes (`AGENT_STATUS_NUDGE_AFTER`) with none.
+Its output carries the reminder into the agent's context, so this one must not
+discard stdout. It costs a few milliseconds per tool call when nothing is due:
+
+```json
+{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command",
+  "command":"agent-bus-cli.sh status --hook tool 2>/dev/null || true"}]}]}
+```
 
 Each post also names the feature branch the box is on, which the Fleet card
 links to in the Files tab. That branch is found from git, not from the session,

@@ -63,9 +63,15 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   is the agent's own words — a hook could only quote the prompt, which is the operator's text and
   goes into permanent history. Turn edges: `status --hook prompt` (UserPromptSubmit), `wake`
   delivering mail, and `status --hook stop` from the Stop guard. Only changes are posted: idle
-  from `wake`'s empty polls once a turn has been over `AGENT_STATUS_IDLE_AFTER` (300 s), working
-  on leaving a posted idle. Hook paths stay silent (UserPromptSubmit stdout becomes model context)
-  and post from a detached child **pinned to the session key** — it outlives the hook's shell, so
+  from Notification `idle_prompt` (`status --hook idle`), else from `wake`'s empty polls once a
+  turn has been over `AGENT_STATUS_IDLE_AFTER` (300 s); working on leaving a posted idle.
+  **`idle_prompt` fires once per turn, 60 s after it ends** (`messageIdleNotifThresholdMs`).
+  On 2.1.301 it fires after typed and `<task-notification>` turns alike. A running background
+  Bash (`wake`) does not hold it back; a running background agent does, so a session with
+  agents out still reads as working. The idle post re-reads `turn` before and after it lands,
+  because a turn starting meanwhile saw "working" and stayed quiet. Hook paths stay silent
+  (UserPromptSubmit stdout becomes model context), except `--hook tool` when it nudges, and
+  post from a detached child **pinned to the session key** — it outlives the hook's shell, so
   an ancestry walk would find no `claude` and an unseen key meets the 409. Each post also carries
   `branch`/`branch_path`. These come from git, not from the session's cwd, which stays at the
   workdir. The CLI takes the most recently active worktree on a non-default branch under the
@@ -77,8 +83,15 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   a background task finishes** (`wake` delivering mail among them, verified on 2.1.300) with a
   prompt starting `<task-notification>`, so the prompt hook reads it, never forwards it, and does
   not count it as an answer. No hook fires on approving a permission prompt, so `permission` and
-  `question` also clear on the next PostToolUse of any tool (`--hook answered`, which greps the
-  local state and exits before the process-tree walk unless something is blocked) and at Stop.
+  `question` also clear on the next PostToolUse of any tool (`--hook tool`, which reads the
+  local state and exits before the process-tree walk unless something is blocked or a nudge is
+  due) and at Stop. `--hook answered` is its older form, which never nudges.
+- **Task nudge.** Agents forget to state a task, and the card then says "no task stated" while
+  they work. `--hook tool` prints PostToolUse `additionalContext` once per turn when a turn has
+  run `AGENT_STATUS_NUDGE_AFTER` (120 s) with no task. The `nudged` file holds the reminded
+  turn's epoch, and a `--clear` writes it too. A subagent's tool calls (hook input has
+  `agent_id`) are skipped. The gate before the key walk is one `grep`, one `date` and builtins:
+  about 1 ms over `answered`.
 - **`onboard`** prints the session-start briefing (the SessionStart hook's output). It is read by
   every agent at every `/clear`, so keep it short and imperative.
 

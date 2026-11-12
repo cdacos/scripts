@@ -94,6 +94,11 @@ Commands:
                               clears it; `--hook tool` clears permission/question, as
                               does the turn ending. (`--hook answered` is the older,
                               silent form of `--hook tool`.)
+  status --hook context       For the Claude Code status line: reads its JSON on
+                              stdin and records the context window's use and the
+                              Remote Control session for the Fleet card, posting
+                              again when use has moved AGENT_STATUS_CONTEXT_STEP
+                              (10) points since the bus last heard.
   docs                        Show the server's usage documentation
   -h, --help                  Show this help
 
@@ -723,16 +728,23 @@ emit_heartbeat() {
 # Local state is one directory per session key, so a /clear (same process, same
 # key) keeps it and a new process starts clean:
 #   turn    "active <epoch>" | "stop <epoch>" -- the latest turn edge
-#   posted  "working <epoch>" | "idle <epoch>" -- what the bus last heard
+#   posted  "working <epoch> <context %>" | "idle <epoch> <context %>" -- what
+#           the bus last heard; the context is "-" when the post carried none
 #   task    the current task text; its mtime is when it was set
 #   name    this session's display handle (Marvin-71), cached from /whoami
 #   waiting "<kind> <epoch>" -- the session is waiting on the operator (see
 #           status_mark_waiting); absent otherwise
 #   nudged  the `turn` epoch of the last turn reminded to state a task
+#   context "<used %> <window tokens>" -- from the status line (status_context);
+#           absent until the session's first reply, and again after a /clear
+#   remote  the Remote Control session id (session_...), from the status line;
+#           absent while Remote Control is off
+#   ctxsent the context figure a repost is on its way with; absent once posted
 AGENT_STATUS="${AGENT_STATUS:-1}"
 AGENT_STATUS_TOPIC="${AGENT_STATUS_TOPIC:-fleet-status}"
 STATUS_IDLE_AFTER="${AGENT_STATUS_IDLE_AFTER:-300}"
 STATUS_NUDGE_AFTER="${AGENT_STATUS_NUDGE_AFTER:-120}"
+STATUS_CONTEXT_STEP="${AGENT_STATUS_CONTEXT_STEP:-10}"
 STATUS_TASK_MAX=120
 STATUS_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/agent/status"
 
@@ -799,6 +811,20 @@ status_publish() {
     _pb_branch=$(printf '%s' "$_pb_git" | cut -f1)
     _pb_bpath=$(printf '%s' "$_pb_git" | cut -s -f2)
     [ -n "$_pb_branch" ] && _pb_body="$_pb_body [on $_pb_branch]"
+    # Context use and the Remote Control session ride every post. Both come from
+    # the status line; without one (a box whose settings have none) the session
+    # id still comes from the harness's own environment, which hooks inherit.
+    _pb_ctx=$(status_field "$1/context" 1)
+    _pb_ctxw=$(status_field "$1/context" 2)
+    case "$_pb_ctx" in '' | *[!0-9]*) _pb_ctx='' ;; esac
+    case "$_pb_ctxw" in '' | *[!0-9]*) _pb_ctxw='' ;; esac
+    [ -n "$_pb_ctx" ] && _pb_body="$_pb_body (context $_pb_ctx%)"
+    if [ -r "$1/remote" ]; then
+        _pb_remote=$(status_field "$1/remote" 1)
+    else
+        _pb_remote=${CLAUDE_CODE_BRIDGE_SESSION_ID:-}
+    fi
+    status_remote_ok "$_pb_remote" || _pb_remote=''
     _pb_wait=$(status_field "$1/waiting" 1)
     _pb_wait_at=''
     if [ -n "$_pb_wait" ]; then
@@ -808,12 +834,17 @@ status_publish() {
     _pb_meta=$(jq -n --arg s "$_pb_name" --arg st "$2" --arg since "$(epoch_iso "$3")" \
         --arg t "$_pb_task" --arg ta "$_pb_task_at" --arg h "$(bus_hostname)" \
         --arg b "$_pb_branch" --arg bp "$_pb_bpath" --arg w "$_pb_wait" --arg wa "$_pb_wait_at" \
+        --arg c "$_pb_ctx" --arg cw "$_pb_ctxw" --arg r "$_pb_remote" \
         '{kind:"status", session:$s, state:$st, since:$since, task:$t, task_at:$ta, host:$h,
           branch:$b, branch_path:$bp}
-         + if $w == "" then {} else {waiting:$w, waiting_since:$wa} end')
+         + if $w == "" then {} else {waiting:$w, waiting_since:$wa} end
+         + if $c == "" then {} else {context:($c | tonumber)} end
+         + if $cw == "" or $c == "" then {} else {context_window:($cw | tonumber)} end
+         + if $r == "" then {} else {remote_session:$r} end')
     _pb_rc=1
     if api POST "/topics/$AGENT_STATUS_TOPIC" -d "$(payload "$_pb_body" "$_pb_meta")" >/dev/null 2>&1; then
-        status_put "$1/posted" "$2 $3"
+        status_put "$1/posted" "$2 $3 ${_pb_ctx:--}"
+        rm -f "$1/ctxsent" 2>/dev/null
         status_put "$1/branch" "$_pb_git"
         _pb_rc=0
     fi
@@ -974,6 +1005,65 @@ status_nudge() {
     [ "$STATUS_NUDGE_AFTER" -lt 120 ] || _nu_for="$((STATUS_NUDGE_AFTER / 60)) minutes"
     jq -nc --arg m "Fleet status: this turn has run for over $_nu_for and your card on the bus web UI says \"no task stated\". If you are working on something, state it in one line: agent-bus-cli.sh status \"<what you are doing>\". If not, ignore this; it is sent once per turn." \
         '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $m}}'
+}
+
+# --- context: how full the session's context window is, and its Remote Control
+# session, for the Fleet card. Only the status line is told either: hooks get
+# neither, and the harness's percentage (input + cache tokens over the model's
+# window) cannot be rebuilt from the transcript without knowing the window. The
+# status line runs after every reply, so it calls `status --hook context` with
+# its own input. The value rides every post; on its own it posts only when it has
+# moved STATUS_CONTEXT_STEP points from what the bus last heard, so a context
+# filling up costs a handful of posts, and a /clear or a compaction one more once
+# the next reply reports the drop. A session with no reply yet reports no figure;
+# that drops the stale one locally but posts nothing, so a status line that
+# briefly reports none cannot make the card flap.
+
+# status_remote_ok <id> -- 0 for something shaped like a Remote Control session
+# id. It ends up in a claude.ai URL on the card, so nothing else is passed on.
+status_remote_ok() {
+    case "$1" in '' | *[!A-Za-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 80 ]
+}
+
+# status_context <dir> -- record the status line's JSON (stdin) for the next post.
+status_context() {
+    # A session with no status directory has never posted: nothing to correct.
+    [ -n "$1" ] && [ -d "$1" ] || return 0
+    _cx=$(jq -r '[(.context_window.used_percentage // "" | tostring),
+                   (.context_window.context_window_size // "" | tostring),
+                   (.remote.session_id // "" | tostring)] | join(" ")' 2>/dev/null) || return 0
+    _cx_used=$(printf '%s' "$_cx" | cut -d' ' -f1)
+    _cx_win=$(printf '%s' "$_cx" | cut -d' ' -f2)
+    # The harness's own variable is what its commit attribution links to, so it
+    # wins; the status line's field covers a harness that does not export it.
+    _cx_remote=${CLAUDE_CODE_BRIDGE_SESSION_ID:-$(printf '%s' "$_cx" | cut -d' ' -f3)}
+    status_remote_ok "$_cx_remote" || _cx_remote=''
+    case "$_cx_used" in '' | *[!0-9]*) _cx_used='' ;; esac
+    case "$_cx_win" in '' | *[!0-9]*) _cx_win=0 ;; esac
+    _cx_was=$(status_field "$1/remote" 1)
+    if [ "$_cx_remote" != "$_cx_was" ]; then
+        if [ -n "$_cx_remote" ]; then status_put "$1/remote" "$_cx_remote"; else rm -f "$1/remote"; fi
+    fi
+    if [ -z "$_cx_used" ]; then
+        rm -f "$1/context" 2>/dev/null
+        return 0
+    fi
+    [ "$(sed -n '1p' "$1/context" 2>/dev/null)" = "$_cx_used $_cx_win" ] ||
+        status_put "$1/context" "$_cx_used $_cx_win"
+    # Measured against the figure a repost is already carrying, if one is in
+    # flight: the status line can run again before the bus has answered. A post
+    # that carried no figure (the session's first, or one from before this field
+    # existed) counts as 0, so the first real reading reaches the card without
+    # waiting for the turn to end.
+    [ -r "$1/posted" ] || return 0
+    _cx_posted=$(status_field "$1/ctxsent" 1)
+    [ -n "$_cx_posted" ] || _cx_posted=$(status_field "$1/posted" 3)
+    case "$_cx_posted" in '' | *[!0-9]*) _cx_posted=0 ;; esac
+    _cx_d=$((_cx_used - _cx_posted))
+    [ "${_cx_d#-}" -ge "$STATUS_CONTEXT_STEP" ] || return 0
+    status_put "$1/ctxsent" "$_cx_used"
+    status_repost_async "$1"
 }
 
 # --- branch: the feature branch this box is working on, for the Fleet card.
@@ -1237,6 +1327,11 @@ case "$cmd" in
                     answered)
                         grep -qsE '^(permission|question) ' "$STATUS_ROOT"/*/waiting || exit 0
                         ;;
+                    context)
+                        # Every reply runs the status line: a box with no
+                        # session state yet has nothing to add to.
+                        [ -d "$STATUS_ROOT" ] || exit 0
+                        ;;
                     tool)
                         if ! grep -qsE '^(permission|question) ' "$STATUS_ROOT"/*/waiting; then
                             _st_now=$(date -u +%s)
@@ -1269,6 +1364,7 @@ case "$cmd" in
                         ;;
                     stop) status_mark_stop ;;
                     idle) status_idle_check now ;;
+                    context) status_context "$(status_dir)" ;;
                     waiting) status_mark_waiting "${3:-}" ;;
                     answered | tool)
                         _st_dir=$(status_dir)

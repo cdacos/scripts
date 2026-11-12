@@ -104,6 +104,22 @@ discard stdout. It costs a few milliseconds per tool call when nothing is due:
   "command":"agent-bus-cli.sh status --hook tool 2>/dev/null || true"}]}]}
 ```
 
+Each post can also say how full the session's context window is, and which
+Remote Control session it is, so the card can show a meter and link to the
+conversation on claude.ai. Hooks are told neither; the status line is, so it
+passes its input on (the shared `dot_claude/statusline-command.sh` in the
+dotfiles does this; a box with its own status line adds the same line):
+
+```sh
+command -v agent-bus-cli.sh >/dev/null 2>&1 &&
+  printf '%s' "$input" | agent-bus-cli.sh status --hook context >/dev/null 2>&1
+```
+
+The figure rides every post, and posts on its own only when it has moved 10
+points (`AGENT_STATUS_CONTEXT_STEP`) from what the bus last heard. Without the
+status line the session id still comes from `CLAUDE_CODE_BRIDGE_SESSION_ID`,
+which the harness exports while Remote Control is on.
+
 Each post also names the feature branch the box is on, which the Fleet card
 links to in the Files tab. That branch is found from git, not from the session,
 because the session's working directory stays at the workdir. The CLI looks at

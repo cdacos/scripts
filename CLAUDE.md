@@ -76,6 +76,14 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   `branch`/`branch_path`. These come from git, not from the session's cwd, which stays at the
   workdir. The CLI takes the most recently active worktree on a non-default branch under the
   served root, within 24 h. `wake`'s tick posts again only when that changes.
+- **Context and Remote Control** ride the same posts as `meta.context` (+ `context_window`) and
+  `meta.remote_session`. Only the status line is told the context figure, so it pipes its JSON to
+  `status --hook context`, which records both in the session's state dir and reposts only when the
+  figure has moved `AGENT_STATUS_CONTEXT_STEP` (10) points from the last post's (`posted` field 3;
+  a post with none counts as 0). A missing figure (a fresh or just-cleared session) drops the local
+  one but never posts, so the card cannot flap. `CLAUDE_CODE_BRIDGE_SESSION_ID` (what the harness's
+  commit attribution links to) beats the status line's `remote.session_id`; either must be
+  `[A-Za-z0-9_-]`, because it ends up in a URL.
 - **Waiting on the operator** rides the same posts as `meta.waiting` (`notified`, `permission`,
   `question`) + `waiting_since`, set by `status --hook waiting <kind>` from PostToolUse
   `PushNotification`, Notification `permission_prompt` and PreToolUse `AskUserQuestion`. Only the

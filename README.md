@@ -190,7 +190,7 @@ installed on disk. Nothing supervised it and nothing would have noticed.
 | `agent.target` | Groups the two, and is what `default.target` wants at boot. |
 | `agent-claude.service` | The agent. `script(1)` supplies the pty its TUI needs; `tmux -L agent` nests inside so a human can still `tmux -L agent attach`. |
 | `agent-fsd.service` | `agent-bus-fsd.sh serve`. Separate, so a daemon crash cannot take the agent down. |
-| `agent-update.timer` | Hourly (plus 2 min after boot): check for drift, prune old builds, and restart the agent onto the installed build when it is idle. `claude update` itself runs on its own ~daily stamp, not every tick. |
+| `agent-update.timer` | Daily at 04:00 UK time (`Europe/London`, not the box's UTC): `claude update`, check for drift, prune old builds, and restart the agent onto the installed build when it is idle -- re-checking every 5 min for up to an hour (`AGENT_IDLE_WAIT_SECS`), then restarting anyway. No run at boot, no catch-up for a missed night. |
 
 Five things are worth knowing before adapting this:
 
@@ -244,8 +244,8 @@ agent-supervision-install.sh up         # after a reboot: start whatever is down
 ```
 
 `up` never restarts a running agent. It first waits (up to 5 min) for a running
-`agent-update.service`: `install` starts the timer, which on a box up longer than
-2 min fires at once, and its `claude update` is not an agent. It exits 2 when the
+`agent-update.service`, whose `claude update` is not an agent; that only happens
+around 04:00 UK time. It exits 2 when the
 session's screen shows a prompt that blocks it while every unit reads healthy (an
 expired login, folder trust) -- `tmux -L agent attach`, answer it, detach with
 `Ctrl-b d`. Run it from a plain shell, not from a claude session: any other claude
@@ -253,7 +253,7 @@ session on the box makes `agent-run.sh` refuse to start. Fleet-wide: `for h in m
 
 Per-box overrides go in `~/.config/agent/run.conf` (`AGENT_NAME`,
 `AGENT_WORKDIR`, `AGENT_CLAUDE_ARGS`, `AGENT_EFFORT`, `AGENT_START_PROMPT`, `AGENT_RESUME`,
-`AGENT_UPDATE_MODE`, `AGENT_IDLE_SETTLE_SECS`, `AGENT_FETCH_MIN_SECS`,
+`AGENT_UPDATE_MODE`, `AGENT_IDLE_SETTLE_SECS`, `AGENT_IDLE_WAIT_SECS`, `AGENT_FETCH_MIN_SECS`,
 `AGENT_KEEP_VERSIONS`). Set `AGENT_UPDATE_MODE=notify` on a box that should
 report drift and never act on it, or `AGENT_RESUME=0` on one whose agent should
 always start from a clean context. `AGENT_EFFORT` (default `xhigh`) is passed as

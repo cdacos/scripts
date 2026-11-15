@@ -11,10 +11,11 @@
 # file, not just the harness -- see daemon_drift() for the fleet-wide capability
 # outage that proved it.
 #
-# Run by agent-update.timer. Restarts agent-claude.service when the box looks
-# idle -- see is_idle() for what that means and why it is imperfect -- and, past
-# AGENT_DEFER_MAX_HOURS, whether it looks idle or not. The ceiling exists because
-# the gate's proxies can be wrong in the direction of "busy" indefinitely.
+# Run by agent-update.timer, once a day at 04:00 UK time. Restarts
+# agent-claude.service when the box looks idle -- see is_idle() for what that
+# means and why it is imperfect -- re-checking for up to AGENT_IDLE_WAIT_SECS,
+# and after that whether it looks idle or not. The bound exists because the
+# gate's proxies can be wrong in the direction of "busy" indefinitely.
 # Managed daemons (AGENT_MANAGED_UNITS) are restarted with no idle gate at all,
 # for reasons given at daemon_drift().
 #
@@ -25,23 +26,29 @@
 # uses one honest signal (does the transcript actually grow?) and retries often,
 # instead of stacking proxies that are each wrong in a different direction.
 #
-# The timer ticks HOURLY. Losing the idle coin toss used to cost 24 hours, which
-# is how a single false "busy" stranded this box on a stale harness for days.
-# The network fetch stays on its own ~daily stamp (AGENT_FETCH_MIN_SECS) so the
-# faster tick does not mean the fleet hammers upstream.
+# The timer ticks DAILY, at an hour chosen so a restart does not land on the
+# operator's working day (the hourly tick it replaced could). One tick a day
+# must not mean one idle coin toss a day: losing it used to cost 24 hours, which
+# is how a single false "busy" stranded this box on a stale harness for days. So
+# the retries happen inside the run instead (restart_when_idle). The network
+# fetch keeps its own stamp (AGENT_FETCH_MIN_SECS), so a manual run does not
+# re-fetch.
 #
 # Per-box overrides in ~/.config/agent/run.conf:
 #   AGENT_UPDATE_MODE       auto | notify   (notify = report drift, never act)
 #   AGENT_IDLE_SETTLE_SECS  quiet needed since the last transcript write (120)
 #   AGENT_IDLE_SAMPLE_SECS  length of the live activity sample  (default 30)
+#   AGENT_IDLE_WAIT_SECS    keep re-checking for idle this long, then restart
+#                           anyway (default 3600; the unit allows 90 min)
+#   AGENT_IDLE_RETRY_SECS   pause between those checks          (default 300)
 #   AGENT_KEEP_VERSIONS     harness builds to retain            (default 3)
 #   AGENT_FETCH_MIN_SECS    min gap between `claude update` runs (default 20h)
 #   AGENT_GUIDANCE_SOURCE   chezmoi source to check   (default ~/.local/share/chezmoi)
 #   AGENT_GUIDANCE_FETCH    1 = fetch before comparing, 0 = local refs only (default 1)
 #   AGENT_GUIDANCE_TIMEOUT  seconds allowed for that fetch      (default 20)
-#   AGENT_DEFER_WARN_HOURS  warn if drift persists this long    (default 24)
-#   AGENT_DEFER_MAX_HOURS   restart anyway past this            (default 48)
 #   AGENT_IDLE_QUIET_SECS   deprecated alias for _SETTLE_SECS
+#   AGENT_DEFER_WARN_HOURS, AGENT_DEFER_MAX_HOURS: retired with the hourly tick,
+#                           and ignored if still set
 #   AGENT_MANAGED_UNITS     space-separated unit:script pairs whose daemon must
 #                           be restarted when its script changes underneath it
 #                           (default agent-fsd.service:~/.local/bin/agent-bus-fsd.sh)
@@ -55,18 +62,17 @@ AGENT_UPDATE_MODE="${AGENT_UPDATE_MODE:-auto}"
 # set it in run.conf, so it is honoured as the settle value rather than ignored.
 AGENT_IDLE_SETTLE_SECS="${AGENT_IDLE_SETTLE_SECS:-${AGENT_IDLE_QUIET_SECS:-120}}"
 AGENT_IDLE_SAMPLE_SECS="${AGENT_IDLE_SAMPLE_SECS:-30}"
+AGENT_IDLE_WAIT_SECS="${AGENT_IDLE_WAIT_SECS:-3600}"
+AGENT_IDLE_RETRY_SECS="${AGENT_IDLE_RETRY_SECS:-300}"
 AGENT_KEEP_VERSIONS="${AGENT_KEEP_VERSIONS:-3}"
 AGENT_FETCH_MIN_SECS="${AGENT_FETCH_MIN_SECS:-72000}"
 AGENT_GUIDANCE_SOURCE="${AGENT_GUIDANCE_SOURCE:-$HOME/.local/share/chezmoi}"
 AGENT_GUIDANCE_FETCH="${AGENT_GUIDANCE_FETCH:-1}"
 AGENT_GUIDANCE_TIMEOUT="${AGENT_GUIDANCE_TIMEOUT:-20}"
-AGENT_DEFER_WARN_HOURS="${AGENT_DEFER_WARN_HOURS:-24}"
-AGENT_DEFER_MAX_HOURS="${AGENT_DEFER_MAX_HOURS:-48}"
 AGENT_MANAGED_UNITS="${AGENT_MANAGED_UNITS:-agent-fsd.service:$HOME/.local/bin/agent-bus-fsd.sh}"
 
 VERSIONS_DIR="$HOME/.local/share/claude/versions"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent"
-DEFER_MARKER="$STATE_DIR/update-deferred-since"
 FETCH_STAMP="$STATE_DIR/last-fetch"
 LOCK="$STATE_DIR/update-check.lock"
 
@@ -152,8 +158,8 @@ newest_size() {
 #
 # So the settle window is short and deliberately not load-bearing -- the live
 # sample below is what decides. The residual failure is bounded: a bookkeeping
-# touch landing inside the window costs one tick, and AGENT_DEFER_MAX_HOURS caps
-# how many such ticks can pass before the restart happens anyway.
+# touch landing inside the window costs one retry, and AGENT_IDLE_WAIT_SECS caps
+# how many such retries can pass before the restart happens anyway.
 transcripts_settled() {
     TRANSCRIPT_WITNESS=''
     _rec=$(newest_transcript) || return 2
@@ -265,8 +271,8 @@ fetch_due() {
 # 404 anonymous for the second.
 #
 # REPORT ONLY. It never pulls. `chezmoi update` runs `git pull --autostash
-# --rebase` against the source, and doing that unattended on an hourly timer
-# could rebase over someone's local edits. Detect and say so; never act.
+# --rebase` against the source, and doing that unattended on a timer could
+# rebase over someone's local edits. Detect and say so; never act.
 #
 # WHY THE FETCH IS NOT OPTIONAL, and this is the whole design. Comparing HEAD to
 # the CACHED origin/main is nearly free and needs no credentials -- but on a box
@@ -296,7 +302,7 @@ guidance_drift() {
     if [ "$AGENT_GUIDANCE_FETCH" = 1 ]; then
         # Through in_agent_env for the same reason `claude update` is: the timer's
         # own environment has neither PATH nor the SSH agent. Bounded, because a
-        # fetch that hangs inside the hourly tick is a worse bug than the drift it
+        # fetch that hangs inside the tick is a worse bug than the drift it
         # is looking for.
         if in_agent_env timeout "$AGENT_GUIDANCE_TIMEOUT" \
                git -C "$_src" fetch --quiet origin 2>/dev/null; then
@@ -444,17 +450,64 @@ prune_versions() {
     done
 }
 
+# --- restart ---------------------------------------------------------------
+# Restart onto the installed build at the first idle check, retrying every
+# AGENT_IDLE_RETRY_SECS; past AGENT_IDLE_WAIT_SECS, restart regardless.
+#
+# The bound replaces a ceiling that used to be counted in ticks across days
+# (AGENT_DEFER_MAX_HOURS, 48h). With one tick a day that ceiling would have
+# meant two or three nights stale, and its integer-hour arithmetic against a
+# jittered tick could slip it by a further day. Inside the run the cost of a
+# false "busy" is one retry, and the restart still happens in the 04:00 window
+# rather than whenever a later tick happens to look idle. A forced restart is
+# survivable for the reason given at the top of this file: the agent resumes,
+# and the bus re-delivers un-acked mail.
+#
+# Between checks the agent may have been restarted by someone else -- by hand,
+# or by systemd after a crash, both of which start the installed build. That is
+# re-checked after every pause, so this never restarts an agent already current.
+restart_when_idle() {
+    _pid=$1
+    _installed_path=$2
+    _deadline=$(( $(date +%s) + AGENT_IDLE_WAIT_SECS ))
+    while :; do
+        if is_idle "$_pid"; then
+            log "idle -- restarting agent-claude.service onto $(basename "$_installed_path")"
+            systemctl --user restart agent-claude.service
+            return 0
+        fi
+        if [ "$(date +%s)" -ge "$_deadline" ]; then
+            log "still busy after ${AGENT_IDLE_WAIT_SECS}s -- restarting onto $(basename "$_installed_path") regardless"
+            systemctl --user restart agent-claude.service
+            return 0
+        fi
+        log "busy -- re-checking in ${AGENT_IDLE_RETRY_SECS}s"
+        sleep "$AGENT_IDLE_RETRY_SECS"
+
+        _pid=$(pgrep -u "$(id -u)" -x claude 2>/dev/null | head -n 1 || true)
+        if [ -z "$_pid" ]; then
+            log "claude exited while waiting -- nothing to restart"
+            return 0
+        fi
+        if [ "$(readlink -f "/proc/$_pid/exe" 2>/dev/null || true)" = "$_installed_path" ]; then
+            log "agent is already on $(basename "$_installed_path") (PID $_pid) -- no restart needed"
+            return 0
+        fi
+    done
+}
+
 # --- main ------------------------------------------------------------------
 main() {
     # Units may have been refreshed on disk by chezmoi since the last run;
     # nothing else reloads them.
     systemctl --user daemon-reload 2>/dev/null || true
 
-    # The tick is hourly; the fetch is not. `claude update` is a network call
-    # against an upstream the whole fleet shares, and nothing about checking for
-    # drift requires re-fetching first -- the drift being checked is between the
-    # running process and what is ALREADY on disk. So they are decoupled: fetch
-    # on its own ~daily stamp, check drift every tick.
+    # The fetch keeps its own stamp, from when the tick was hourly. `claude
+    # update` is a network call against an upstream the whole fleet shares, and
+    # nothing about checking for drift requires re-fetching first -- the drift
+    # being checked is between the running process and what is ALREADY on disk.
+    # With a daily tick the stamp is always due; it still stops a hand-run
+    # check from re-fetching.
     if [ "$AGENT_UPDATE_MODE" = auto ] && fetch_due; then
         in_agent_env claude update 2>&1 | sed 's/^/agent-update:   /' >&2 ||
             log "claude update failed; continuing with what is on disk"
@@ -510,56 +563,21 @@ main() {
 
     if [ "$running_path" = "$installed_path" ]; then
         log "up to date ($running); no restart"
-        rm -f "$DEFER_MARKER"
         return 0
     fi
 
     log "harness drift: PID $pid runs $running_path, installed is $installed_path"
-    [ -f "$DEFER_MARKER" ] || date +%s > "$DEFER_MARKER"
 
     if [ "$AGENT_UPDATE_MODE" != auto ]; then
         log "AGENT_UPDATE_MODE=$AGENT_UPDATE_MODE -- reporting only, leaving the agent alone"
         return 0
     fi
 
-    if is_idle "$pid"; then
-        log "idle -- restarting agent-claude.service onto $installed"
-        rm -f "$DEFER_MARKER"
-        systemctl --user restart agent-claude.service
-        return 0
-    fi
-
-    since=$(cat "$DEFER_MARKER" 2>/dev/null || echo 0)
-    case "$since" in '' | *[!0-9]*) since=0 ;; esac
-    hours=$(( ( $(date +%s) - since ) / 3600 ))
-
-    # A ceiling, because deferral with no upper bound is exactly how a box stays
-    # stale forever. The gate samples one instant per day against proxies that
-    # are allowed to be wrong; before this, a box that lost the coin toss simply
-    # waited another 24h, and AGENT_DEFER_WARN_HOURS only ever printed advice to
-    # a journal nobody reads. Past the ceiling the restart wins the argument: the
-    # bus re-delivers un-acked mail, so the cost is a repeated turn, against an
-    # agent that otherwise never updates at all.
-    if [ "$since" -gt 0 ] && [ "$hours" -ge "$AGENT_DEFER_MAX_HOURS" ]; then
-        log "drift deferred ${hours}h, at or past the ${AGENT_DEFER_MAX_HOURS}h ceiling -- restarting onto $installed regardless"
-        rm -f "$DEFER_MARKER"
-        systemctl --user restart agent-claude.service
-        return 0
-    fi
-
-    # Once per AGENT_DEFER_WARN_HOURS, not once per tick. The tick is hourly now,
-    # and a warning that repeats 24 times a day is one nobody reads -- which was
-    # already this line's problem back when it fired daily.
-    if [ "$hours" -ge "$AGENT_DEFER_WARN_HOURS" ] &&
-       [ $(( hours % AGENT_DEFER_WARN_HOURS )) -eq 0 ]; then
-        log "WARNING: drift deferred for ${hours}h -- the box has not been idle since. Restart by hand: systemctl --user restart agent-claude.service"
-    else
-        log "busy -- deferring to the next tick (drift ${hours}h old)"
-    fi
+    restart_when_idle "$pid" "$installed_path"
 }
 
-# One check at a time; an AGENT_IDLE_SAMPLE_SECS window plus a network update
-# can easily overlap the next tick.
+# One check at a time: a hand run of this script while a tick is still waiting
+# for idle must not race it to the restart.
 exec 9>"$LOCK"
 flock -n 9 || { log "another check is already running"; exit 0; }
 main

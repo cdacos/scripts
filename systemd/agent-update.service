@@ -7,4 +7,5 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/agent-update-check.sh
-TimeoutStartSec=15min
+# Up to AGENT_IDLE_WAIT_SECS (1h) waiting for an idle moment, plus the fetch.
+TimeoutStartSec=90min

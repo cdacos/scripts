@@ -39,12 +39,13 @@ any_alive() {
     return 1
 }
 
-# `install` starts agent-update.timer. On a box up longer than OnBootSec that
-# timer is already overdue, so it fires at once: `claude update`, then a drift
-# check that may restart agent-claude.service. An `up` straight afterwards took
-# the updater for an agent and refused (porky, 2026-10-14); a cutover would have
-# killed it mid-install. So both wait for it, bounded: the unit's own limit is
-# TimeoutStartSec=15min, and a hung fetch should not hold either step that long.
+# agent-update.service runs `claude update`, then a drift check that may restart
+# agent-claude.service. An `up` that overlapped it took the updater for an agent
+# and refused (porky, 2026-10-14); a cutover would have killed it mid-install.
+# So both wait for it, bounded. The timer now fires only at 04:00 UK time (it
+# used to fire at once on `install`, via OnBootSec), so this matters only inside
+# that window -- where the check may wait up to an hour for idle, and the right
+# answer is to re-run later rather than hold this step that long.
 UPDATE_WAIT_SECS=300
 wait_for_update_check() {
     _n=0

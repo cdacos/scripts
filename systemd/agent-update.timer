@@ -1,20 +1,24 @@
 [Unit]
-Description=Hourly harness update check for the supervised agent
+Description=Daily harness update check for the supervised agent
 
 [Timer]
 Unit=agent-update.service
-OnBootSec=2min
-# Hourly, not daily. The check is cheap (the network fetch is gated separately
-# inside agent-update-check.sh on its own ~daily stamp), and the cadence is the
-# whole point: a single false "busy" used to cost a full day, which is how a box
-# stays on a stale harness for a week. At this rate a missed window costs an
-# hour, and the AGENT_DEFER_MAX_HOURS ceiling lands within an hour of its mark
-# instead of depending on where the jitter fell.
-OnCalendar=hourly
+# Once a day, at 04:00 UK time. The idle gate can only see "between turns", not
+# "nobody is using this session", so on an hourly tick a restart could land in
+# the middle of the operator's working day. The zone is explicit rather than the
+# box's own (the VMs run UTC), so the hour follows the operator through DST.
+#
+# A "busy" at 04:00 no longer costs a day, which is what the hourly tick used to
+# guard against: agent-update-check.sh keeps re-checking inside the run, up to
+# AGENT_IDLE_WAIT_SECS, then restarts anyway.
+#
+# Deliberately no OnBootSec and no Persistent: either would run the check at
+# whatever hour the box happened to boot, and a restart minutes after boot is
+# exactly the out-of-hours surprise this schedule exists to avoid. A box that
+# was down at 04:00 catches up the next night.
+OnCalendar=*-*-* 04:00:00 Europe/London
 # The fleet shares an upstream; do not have every VM tick at the same instant.
-# Small, because it no longer has to be smaller than the window it might miss.
 RandomizedDelaySec=5min
-Persistent=true
 AccuracySec=1m
 
 [Install]

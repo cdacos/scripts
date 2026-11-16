@@ -73,6 +73,17 @@ ExecStop=/usr/bin/tmux -L agent kill-server
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
+# The default (OOMPolicy=stop) stops this whole unit when the OOM killer takes ANY
+# process in it, so a sub-agent's eslint (~1.9 GB, type-aware, on a 3.9 GB VM) dying
+# also took the orchestrator and every worker: wile, 2026-11-15/16, "Failed with
+# result 'oom-kill'", three restarts. With continue, only the victim dies; the
+# agent sees its Bash call killed (137) and carries on. The kernel picks the
+# largest process, which is the build/lint, not claude. If claude itself is the
+# victim, the pane closes and Restart=always restarts the unit as before.
+# Verified 2026-11-16 on marvin with mimic units (MemoryMax=80M): stop -> unit
+# failed; continue -> child 137, unit active. daemon-reload alone switches a
+# running unit over; no restart needed.
+OOMPolicy=continue
 
 [Install]
 WantedBy=agent.target

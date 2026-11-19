@@ -174,6 +174,39 @@ Checks for missing CLI tools and chezmoi configuration drift. Shows installation
 check-tools.sh
 ```
 
+### GitHub App identity (`github-app-token.sh`, `gh-wrapper.sh`)
+
+Lets a fleet agent work in an organisation's repos as its own GitHub App's bot
+(`cdacos-dev-<agent>[bot]`) instead of a user account, which takes no paid seat.
+Tokens last one hour and reach only the repos the App is installed on. Other owners
+keep the agent's personal `GH_TOKEN` and SSH, unchanged.
+
+The App is registered and installed once per agent with `github-app-enrol.sh --standalone`
+(jnc-labs/agent-platform, `docs/github-app-agents.md`). That leaves, in `~/.config/github-app`:
+`app.json` (the App's ids), `key.pem` (its private key, 0600) and `orgs` (the owners it serves).
+Then, once per box:
+
+```sh
+github-app-token.sh setup     # route the orgs in ~/.config/github-app/orgs through the App
+```
+
+`setup` writes `~/.config/github-app/gitconfig` and includes it from `~/.gitconfig.local`
+(per-machine, not chezmoi-managed). For each org it rewrites `git@github.com:<org>/` remotes to
+HTTPS, answers git's credential requests with the App's token, and commits as the bot. A box with
+no `orgs` file is unaffected, and so is every other owner.
+
+```sh
+github-app-token.sh peermusicglobaltech          # a token (cached for 55 of its 60 minutes)
+github-app-token.sh --drop peermusicglobaltech   # forget it, e.g. after a 401 from gh
+```
+
+`gh-wrapper.sh` is installed as `~/.local/bin/gh`, ahead of the real `gh`. It picks `GH_TOKEN` by
+repo owner (from `-R`, a URL, `GH_REPO`, a `gh api repos/<owner>/` path or the checkout's origin).
+`gh api user` always keeps the personal token, because GitHub refuses App tokens there.
+
+Check who pushed from GitHub's records (`gh api "repos/<o>/<r>/activity?ref=refs/heads/<branch>"`),
+never from the commit author, which is only what git was told locally.
+
 ### Agent supervision (`agent-supervision-install.sh`, `agent-run.sh`, `agent-env.sh`, `agent-update-check.sh`)
 
 Puts a fleet agent's `claude` session and its file daemon under `systemd --user`:
@@ -283,6 +316,19 @@ Add to your `.chezmoiexternal.toml`:
 [".local/bin/check-tools.sh"]
     type = "file"
     url = "https://raw.githubusercontent.com/cdacos/scripts/main/check-tools.sh"
+    executable = true
+    refreshPeriod = "0"
+
+[".local/bin/github-app-token.sh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/github-app-token.sh"
+    executable = true
+    refreshPeriod = "0"
+
+# Installed as gh: it must come before the real gh on PATH.
+[".local/bin/gh"]
+    type = "file"
+    url = "https://raw.githubusercontent.com/cdacos/scripts/main/gh-wrapper.sh"
     executable = true
     refreshPeriod = "0"
 

@@ -155,6 +155,17 @@ exists for it**.
   path that lets the session stop, records the turn's end via `agent-bus-cli.sh status --hook
   stop` (skipped if the CLI is not on PATH). Self-gates on `AGENT_BUS_TOKEN`.
 - `systemd/` — `agent.target`, `agent-claude.service`, `agent-fsd.service`, `agent-update.{service,timer}`.
+- `github-app-token.sh` — a GitHub App installation token per owner, git's credential helper
+  (`credential get|store|erase`) and `setup`, which writes the per-org git config (HTTPS rewrite,
+  helper, bot identity via `includeIf hasconfig:remote.*.url`) and includes it from the unmanaged
+  `~/.gitconfig.local`, never from the shared `.gitconfig`. Owners not in `~/.config/github-app/orgs`
+  get silence, so git and gh fall back to the user's credentials. "Not installed" is never cached,
+  and a failed mint or a `credential erase` (git got a 401) drops both the cached token and the
+  installation id, because an uninstall revokes tokens at once and a reinstall changes the id. The token's lifetime is not
+  parsed from GitHub's reply (`date -d` is GNU-only): it is cached for 55 minutes from minting.
+- `gh-wrapper.sh` — installed as `~/.local/bin/gh`: sets `GH_TOKEN` from `github-app-token.sh` for
+  App owners, then execs the real gh (`GH_REAL`, else the first `gh` on PATH that is not itself).
+  `gh api user` keeps the personal token. A pass-through without `github-app-token.sh` or `orgs`.
 - `check-tools.sh` — reports missing CLI tools from its `TOOLS` table (`cmd|description|apt|brew|url|alt-cmd`) and chezmoi drift.
 - `statusline-command.sh` — Claude Code status line.
 - `docs/plans/` — historical design plans.

@@ -223,7 +223,7 @@ installed on disk. Nothing supervised it and nothing would have noticed.
 | `agent.target` | Groups the two, and is what `default.target` wants at boot. |
 | `agent-claude.service` | The agent. `script(1)` supplies the pty its TUI needs; `tmux -L agent` nests inside so a human can still `tmux -L agent attach`. |
 | `agent-fsd.service` | `agent-bus-fsd.sh serve`. Separate, so a daemon crash cannot take the agent down. |
-| `agent-update.timer` | Daily at 04:00 UK time (`Europe/London`, not the box's UTC): `claude update`, check for drift, prune old builds, and restart the agent onto the installed build when it is idle -- re-checking every 5 min for up to an hour (`AGENT_IDLE_WAIT_SECS`), then restarting anyway. No run at boot, no catch-up for a missed night. |
+| `agent-update.timer` | Daily at 04:00 UK time (`Europe/London`, not the box's UTC): `claude update`, bring chezmoi guidance current (fast-forward only, and only into an untouched source clone), check for drift, prune old builds, and restart the agent onto the installed build when it is idle -- re-checking every 5 min for up to an hour (`AGENT_IDLE_WAIT_SECS`), then restarting anyway. No run at boot, no catch-up for a missed night. |
 
 Five things are worth knowing before adapting this:
 

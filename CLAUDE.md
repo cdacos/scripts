@@ -150,7 +150,11 @@ exists for it**.
   cannot do (linger, daemon-reload, enable, handing a tmux-started agent over to systemd).
 - `agent-update-check.sh` — run by `agent-update.timer`; restarts the agent when the running build
   differs from the installed one (the restart *is* the update), and does the same for long-lived
-  daemons.
+  daemons. Brings chezmoi guidance current first: fast-forward plus `chezmoi apply`, never
+  `chezmoi update`'s rebase, and only when the source clone is on `main`, clean (untracked files
+  included), strictly behind `origin/main`, and no target was edited by hand. Otherwise it reports
+  and leaves everything as found. A failed apply leaves a marker so the next tick retries rather
+  than reading "current".
 - `agent-bus-monitor-guard.sh` — Stop hook; blocks idle while no `wake` is running, and on every
   path that lets the session stop, records the turn's end via `agent-bus-cli.sh status --hook
   stop` (skipped if the CLI is not on PATH). Self-gates on `AGENT_BUS_TOKEN`.

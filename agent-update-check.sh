@@ -11,6 +11,10 @@
 # file, not just the harness -- see daemon_drift() for the fleet-wide capability
 # outage that proved it.
 #
+# Guidance (the chezmoi-delivered CLAUDE.md rules) has the same gap one level
+# up: merged is not installed. guidance_drift() fast-forwards and applies it
+# when the source clone is provably untouched, and only reports otherwise.
+#
 # Run by agent-update.timer, once a day at 04:00 UK time. Restarts
 # agent-claude.service when the box looks idle -- see is_idle() for what that
 # means and why it is imperfect -- re-checking for up to AGENT_IDLE_WAIT_SECS,
@@ -46,6 +50,8 @@
 #   AGENT_GUIDANCE_SOURCE   chezmoi source to check   (default ~/.local/share/chezmoi)
 #   AGENT_GUIDANCE_FETCH    1 = fetch before comparing, 0 = local refs only (default 1)
 #   AGENT_GUIDANCE_TIMEOUT  seconds allowed for that fetch      (default 20)
+#   AGENT_GUIDANCE_APPLY_TIMEOUT  seconds allowed for each chezmoi call when
+#                           guidance is brought current        (default 120)
 #   AGENT_IDLE_QUIET_SECS   deprecated alias for _SETTLE_SECS
 #   AGENT_DEFER_WARN_HOURS, AGENT_DEFER_MAX_HOURS: retired with the hourly tick,
 #                           and ignored if still set
@@ -69,11 +75,13 @@ AGENT_FETCH_MIN_SECS="${AGENT_FETCH_MIN_SECS:-72000}"
 AGENT_GUIDANCE_SOURCE="${AGENT_GUIDANCE_SOURCE:-$HOME/.local/share/chezmoi}"
 AGENT_GUIDANCE_FETCH="${AGENT_GUIDANCE_FETCH:-1}"
 AGENT_GUIDANCE_TIMEOUT="${AGENT_GUIDANCE_TIMEOUT:-20}"
+AGENT_GUIDANCE_APPLY_TIMEOUT="${AGENT_GUIDANCE_APPLY_TIMEOUT:-120}"
 AGENT_MANAGED_UNITS="${AGENT_MANAGED_UNITS:-agent-fsd.service:$HOME/.local/bin/agent-bus-fsd.sh}"
 
 VERSIONS_DIR="$HOME/.local/share/claude/versions"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent"
 FETCH_STAMP="$STATE_DIR/last-fetch"
+GUIDANCE_UNAPPLIED="$STATE_DIR/guidance-unapplied"
 LOCK="$STATE_DIR/update-check.lock"
 
 mkdir -p "$STATE_DIR"
@@ -270,9 +278,29 @@ fetch_due() {
 # Verified 2026-08-27: raw.githubusercontent.com returns 200 for the first and
 # 404 anonymous for the second.
 #
-# REPORT ONLY. It never pulls. `chezmoi update` runs `git pull --autostash
-# --rebase` against the source, and doing that unattended on a timer could
-# rebase over someone's local edits. Detect and say so; never act.
+# FAST-FORWARD ONLY, and only into a clone nobody is working in. This used to
+# report and never act, because `chezmoi update` runs `git pull --autostash
+# --rebase` -- unattended, that could rebase over someone's local edits. The
+# risk was real but narrower than the rule: a fast-forward rewrites nothing, and
+# agents do edit this clone with plain git (branches, commits for a dotfiles PR).
+# Report-only cost what it was meant to prevent the other way round: dotfiles#8
+# merged on 2026-11-20 and three days later was in force on one box of six, the
+# one whose agent had pulled by hand, while every other box's daily check logged
+# "1 commit(s) behind" to a journal nobody reads.
+#
+# So with AGENT_UPDATE_MODE=auto it now does what `chezmoi update` does, minus
+# the rebase, when -- and only when -- guidance_pullable() finds the clone on
+# main, with no uncommitted or untracked files, strictly behind origin/main, and
+# no target edited by hand since chezmoi last wrote it. Anything else is left
+# exactly as found and reported, as before. Two consequences worth knowing:
+#   - `chezmoi apply` refreshes every external that is due, and the fleet's
+#     scripts mostly use refreshPeriod "1s", so a guidance update also brings
+#     this box's scripts to cdacos/scripts main -- as a hand `chezmoi update`
+#     does.
+#   - It runs before daemon_drift() and the harness restart in main(), so a
+#     script it replaces gets its daemon restarted, and a restarted agent starts
+#     on the new rules, in the same tick. That includes this script: chezmoi
+#     replaces files by rename, so the shell running it keeps the old inode.
 #
 # WHY THE FETCH IS NOT OPTIONAL, and this is the whole design. Comparing HEAD to
 # the CACHED origin/main is nearly free and needs no credentials -- but on a box
@@ -322,14 +350,25 @@ guidance_drift() {
     _behind=$(git -C "$_src" rev-list --count HEAD..origin/main 2>/dev/null || true)
     case "$_behind" in '' | *[!0-9]*) log "guidance: cannot count revisions -- refusing to guess"; return 0 ;; esac
 
-    if [ "$_behind" -eq 0 ]; then
+    # A failed apply on an earlier tick leaves the source ahead of what is in
+    # force, and from then on HEAD == origin/main reads as "current" -- the
+    # false-healthy this file exists to refuse. The marker keeps it a retry.
+    _pending=''
+    if [ -f "$GUIDANCE_UNAPPLIED" ]; then
+        _pending=$(cat "$GUIDANCE_UNAPPLIED" 2>/dev/null) || _pending=''
+        _pending=${_pending:-unknown}
+    fi
+
+    if [ "$_behind" -eq 0 ] && [ -z "$_pending" ]; then
         [ "$_fresh" = yes ] && log "guidance: current ($_head)"
         return 0
     fi
 
     # Never report a bare count against a ref we did not just refresh.
-    if [ "$_fresh" = yes ]; then
-        log "guidance: $_behind commit(s) behind -- HEAD $_head, origin/main $_remote. Run: chezmoi update"
+    if [ "$_behind" -eq 0 ]; then
+        _gap="source is current ($_head) but NOT applied -- chezmoi apply of $_pending failed on an earlier tick"
+    elif [ "$_fresh" = yes ]; then
+        _gap="$_behind commit(s) behind -- HEAD $_head, origin/main $_remote"
     else
         _witness="ref age unknown"
         if [ -f "$_src/.git/FETCH_HEAD" ]; then
@@ -339,8 +378,111 @@ guidance_drift() {
                 *) _witness="last fetched $(( ( $(date +%s) - _mt ) / 3600 ))h ago" ;;
             esac
         fi
-        log "guidance: at least $_behind commit(s) behind -- HEAD $_head vs CACHED origin/main $_remote ($_witness). The real gap may be larger; this count is against a ref that was not refreshed. Run: chezmoi update"
+        _gap="at least $_behind commit(s) behind -- HEAD $_head vs CACHED origin/main $_remote ($_witness). The real gap may be larger; this count is against a ref that was not refreshed"
     fi
+
+    if [ "$AGENT_UPDATE_MODE" != auto ]; then
+        log "guidance: $_gap. AGENT_UPDATE_MODE=$AGENT_UPDATE_MODE, reporting only. Run: chezmoi update"
+        return 0
+    fi
+    if ! guidance_pullable "$_src"; then
+        log "guidance: $_gap. Not updating: $GUIDANCE_BLOCKER. Run by hand once that is resolved: chezmoi update"
+        return 0
+    fi
+
+    # A stale cached ref is still safe to move to: HEAD is its ancestor, so this
+    # only ever goes forward. The log line above says how stale it may be.
+    if [ "$_behind" -gt 0 ] &&
+        ! git -C "$_src" merge --ff-only --quiet origin/main >/dev/null 2>&1; then
+        log "guidance: $_gap. Fast-forward FAILED -- source left at $_head. Run: chezmoi update"
+        return 0
+    fi
+
+    # </dev/null and --no-tty: a prompt must fail the apply, never wait on a tty
+    # that is not there. guidance_pullable() has already ruled out the one prompt
+    # an ordinary apply raises (a target edited by hand).
+    _rc=0
+    _out=$(in_agent_env timeout "$AGENT_GUIDANCE_APPLY_TIMEOUT" \
+        chezmoi apply --no-tty </dev/null 2>&1) || _rc=$?
+    [ -n "$_out" ] && printf '%s\n' "$_out" | sed 's/^/agent-update:   /' >&2
+    if [ "$_rc" -ne 0 ]; then
+        # The false-healthy to avoid: guidance= in the heartbeat now reads the new
+        # commit while applied= still hashes the old CLAUDE.md. Say so plainly,
+        # and leave the marker so the next tick retries instead of reading
+        # "current".
+        printf '%s\n' "$_remote" >"$GUIDANCE_UNAPPLIED" 2>/dev/null || true
+        log "guidance: source is at $_remote (was $_head), but chezmoi apply FAILED (exit $_rc) -- the new guidance is NOT in force; the next tick retries. Run: chezmoi apply"
+        return 0
+    fi
+    rm -f "$GUIDANCE_UNAPPLIED"
+    # Units may be among what was just written; main() reloaded before this ran.
+    systemctl --user daemon-reload 2>/dev/null || true
+    if [ "$_behind" -eq 0 ]; then
+        log "guidance: applied $_head (retry of a failed apply); sessions pick it up at their next start or /clear"
+    else
+        log "guidance: updated $_head -> $_remote and applied ($_behind commit(s)); sessions pick it up at their next start or /clear"
+    fi
+}
+
+# Is the chezmoi source safe to fast-forward and apply unattended? 0 = yes;
+# 1 = no, with the reason in GUIDANCE_BLOCKER. Called directly, never in $(...),
+# so the global reaches the caller. Each check guards a way someone's work could
+# be in the clone or on the box:
+#   not on main          -- a branch being worked on, or a rebase in progress
+#   uncommitted/untracked -- an edit in progress; untracked too, because chezmoi
+#                           would APPLY a half-written new source file
+#   HEAD not an ancestor -- local commits not on origin/main (an unpushed edit,
+#                           or chezmoi's autoCommit without the push)
+#   target edited by hand -- a local patch under test, e.g. a script in
+#                           ~/.local/bin; apply would overwrite it, or prompt
+# The window between these checks and the merge is milliseconds at 04:00; the
+# merge itself still refuses to overwrite anything git can see.
+guidance_pullable() {
+    _src=$1
+    GUIDANCE_BLOCKER=''
+
+    _branch=$(git -C "$_src" symbolic-ref --short -q HEAD 2>/dev/null) || _branch=''
+    if [ "$_branch" != main ]; then
+        GUIDANCE_BLOCKER="source is on '${_branch:-a detached HEAD}', not main"
+        return 1
+    fi
+
+    if ! _dirty=$(git -C "$_src" status --porcelain 2>/dev/null); then
+        GUIDANCE_BLOCKER="git status failed in $_src -- refusing to guess"
+        return 1
+    fi
+    if [ -n "$_dirty" ]; then
+        GUIDANCE_BLOCKER="source has uncommitted or untracked files ($(printf '%s\n' "$_dirty" | wc -l) path(s))"
+        return 1
+    fi
+
+    _rc=0
+    git -C "$_src" merge-base --is-ancestor HEAD origin/main 2>/dev/null || _rc=$?
+    case "$_rc" in
+        0) ;;
+        1) GUIDANCE_BLOCKER="local main has commits origin/main does not"; return 1 ;;
+        *) GUIDANCE_BLOCKER="cannot compare HEAD with origin/main -- refusing to guess"; return 1 ;;
+    esac
+
+    # First column of `chezmoi status`: has the target changed since chezmoi
+    # last wrote it? Second column is what apply would do, which is expected.
+    _rc=0
+    _st=$(in_agent_env timeout "$AGENT_GUIDANCE_APPLY_TIMEOUT" \
+        chezmoi status --no-tty </dev/null 2>/dev/null) || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        GUIDANCE_BLOCKER="chezmoi status failed (exit $_rc) -- refusing to guess"
+        return 1
+    fi
+    _rc=0
+    printf '%s\n' "$_st" | grep -q '^[^ ]' || _rc=$?
+    case "$_rc" in
+        0)
+            _edited=$(printf '%s\n' "$_st" | grep '^[^ ]' | cut -c4- | head -n 5 | tr '\n' ' ')
+            GUIDANCE_BLOCKER="target(s) edited by hand since chezmoi last wrote them: ${_edited% }"
+            return 1 ;;
+        1) return 0 ;;
+        *) GUIDANCE_BLOCKER="cannot read chezmoi status -- refusing to guess"; return 1 ;;
+    esac
 }
 
 # --- daemon drift ----------------------------------------------------------
@@ -514,6 +656,15 @@ main() {
         date +%s > "$FETCH_STAMP"
     fi
 
+    # Guidance first: bringing it current runs `chezmoi apply`, which can replace
+    # a daemon's script (so daemon_drift must come after, to restart onto it in
+    # this tick) and the rules a restarted agent starts on. Before the harness
+    # lookup too, because whether an agent is running has no bearing on whether
+    # the box's guidance is current -- and a box with claude stopped used to skip
+    # this check entirely. Also deliberately before the up-to-date return below:
+    # a box can be on the current build and still be running week-old rules.
+    guidance_drift
+
     # Before the harness lookup, and deliberately so: a daemon's staleness has
     # nothing to do with whether an agent happens to be running on this box, and
     # the early return below would otherwise skip the check entirely on any box
@@ -556,10 +707,6 @@ main() {
 
     # Only meaningful on a native install; a no-op where there is no versions/ dir.
     prune_versions "$running" "$installed"
-
-    # Independent of harness drift, and deliberately before the up-to-date return
-    # below: a box can be on the current build and still be running week-old rules.
-    guidance_drift
 
     if [ "$running_path" = "$installed_path" ]; then
         log "up to date ($running); no restart"

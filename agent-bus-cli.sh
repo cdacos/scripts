@@ -1092,7 +1092,8 @@ status_branch() {
             awk '/^worktree /{wt=substr($0,10)} /^branch refs\/heads\//{print substr($0,19) "\t" wt}' |
             sort -u |
             while IFS="$_sb_tab" read -r _sb_br _sb_wt; do
-                case "$_sb_br" in main | master) continue ;; esac
+                # Not a case: bash 3.2 (macOS /bin/sh) cannot parse a case pattern inside $( ).
+                [ "$_sb_br" = main ] || [ "$_sb_br" = master ] && continue
                 _sb_def=$(git -C "$_sb_wt" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) || _sb_def=''
                 [ "$_sb_br" = "${_sb_def#origin/}" ] && continue
                 _sb_gd=$(git -C "$_sb_wt" rev-parse --absolute-git-dir 2>/dev/null) || continue

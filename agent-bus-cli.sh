@@ -95,10 +95,12 @@ Commands:
                               does the turn ending. (`--hook answered` is the older,
                               silent form of `--hook tool`.)
   status --hook context       For the Claude Code status line: reads its JSON on
-                              stdin and records the context window's use and the
-                              Remote Control session for the Fleet card, posting
-                              again when use has moved AGENT_STATUS_CONTEXT_STEP
-                              (10) points since the bus last heard.
+                              stdin and records the context window's use, the
+                              model and effort level, and the Remote Control
+                              session for the Fleet card, posting again when use
+                              has moved AGENT_STATUS_CONTEXT_STEP (10) points, or
+                              the model or effort has changed, since the bus last
+                              heard.
   docs                        Show the server's usage documentation
   -h, --help                  Show this help
 
@@ -740,6 +742,9 @@ emit_heartbeat() {
 #   remote  the Remote Control session id (session_...), from the status line;
 #           absent while Remote Control is off
 #   ctxsent the context figure a repost is on its way with; absent once posted
+#   model   "<effort> <model name>" -- from the status line; the effort is "-"
+#           for a model without effort levels. Absent until it first runs
+#   modelsent the model line the bus last heard, or a repost is carrying
 AGENT_STATUS="${AGENT_STATUS:-1}"
 AGENT_STATUS_TOPIC="${AGENT_STATUS_TOPIC:-fleet-status}"
 STATUS_IDLE_AFTER="${AGENT_STATUS_IDLE_AFTER:-300}"
@@ -825,6 +830,12 @@ status_publish() {
         _pb_remote=${CLAUDE_CODE_BRIDGE_SESSION_ID:-}
     fi
     status_remote_ok "$_pb_remote" || _pb_remote=''
+    _pb_model=''
+    [ -r "$1/model" ] && _pb_model=$(sed -n '1p' "$1/model" 2>/dev/null)
+    _pb_effort=${_pb_model%% *}
+    _pb_mname=${_pb_model#* }
+    [ "$_pb_effort" != - ] || _pb_effort=''
+    [ "$_pb_mname" != "$_pb_model" ] || _pb_mname=''
     _pb_wait=$(status_field "$1/waiting" 1)
     _pb_wait_at=''
     if [ -n "$_pb_wait" ]; then
@@ -835,16 +846,20 @@ status_publish() {
         --arg t "$_pb_task" --arg ta "$_pb_task_at" --arg h "$(bus_hostname)" \
         --arg b "$_pb_branch" --arg bp "$_pb_bpath" --arg w "$_pb_wait" --arg wa "$_pb_wait_at" \
         --arg c "$_pb_ctx" --arg cw "$_pb_ctxw" --arg r "$_pb_remote" \
+        --arg mo "$_pb_mname" --arg ef "$_pb_effort" \
         '{kind:"status", session:$s, state:$st, since:$since, task:$t, task_at:$ta, host:$h,
           branch:$b, branch_path:$bp}
          + if $w == "" then {} else {waiting:$w, waiting_since:$wa} end
          + if $c == "" then {} else {context:($c | tonumber)} end
          + if $cw == "" or $c == "" then {} else {context_window:($cw | tonumber)} end
-         + if $r == "" then {} else {remote_session:$r} end')
+         + if $r == "" then {} else {remote_session:$r} end
+         + if $mo == "" then {} else {model:$mo} end
+         + if $ef == "" or $mo == "" then {} else {effort:$ef} end')
     _pb_rc=1
     if api POST "/topics/$AGENT_STATUS_TOPIC" -d "$(payload "$_pb_body" "$_pb_meta")" >/dev/null 2>&1; then
         status_put "$1/posted" "$2 $3 ${_pb_ctx:--}"
         rm -f "$1/ctxsent" 2>/dev/null
+        if [ -n "$_pb_model" ]; then status_put "$1/modelsent" "$_pb_model"; else rm -f "$1/modelsent" 2>/dev/null; fi
         status_put "$1/branch" "$_pb_git"
         _pb_rc=0
     fi
@@ -1007,8 +1022,8 @@ status_nudge() {
         '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $m}}'
 }
 
-# --- context: how full the session's context window is, and its Remote Control
-# session, for the Fleet card. Only the status line is told either: hooks get
+# --- context: how full the session's context window is, its model and effort
+# level, and its Remote Control session, for the Fleet card. Only the status line is told either: hooks get
 # neither, and the harness's percentage (input + cache tokens over the model's
 # window) cannot be rebuilt from the transcript without knowing the window. The
 # status line runs after every reply, so it calls `status --hook context` with
@@ -1017,7 +1032,9 @@ status_nudge() {
 # filling up costs a handful of posts, and a /clear or a compaction one more once
 # the next reply reports the drop. A session with no reply yet reports no figure;
 # that drops the stale one locally but posts nothing, so a status line that
-# briefly reports none cannot make the card flap.
+# briefly reports none cannot make the card flap. A change of model or effort
+# (/model, /effort) posts at once: it is rare, and the card would otherwise show
+# the old one until the next turn edge.
 
 # status_remote_ok <id> -- 0 for something shaped like a Remote Control session
 # id. It ends up in a claude.ai URL on the card, so nothing else is passed on.
@@ -1032,13 +1049,30 @@ status_context() {
     [ -n "$1" ] && [ -d "$1" ] || return 0
     _cx=$(jq -r '[(.context_window.used_percentage // "" | tostring),
                    (.context_window.context_window_size // "" | tostring),
-                   (.remote.session_id // "" | tostring)] | join(" ")' 2>/dev/null) || return 0
-    _cx_used=$(printf '%s' "$_cx" | cut -d' ' -f1)
-    _cx_win=$(printf '%s' "$_cx" | cut -d' ' -f2)
+                   (.remote.session_id // "" | tostring),
+                   (.effort.level // "" | tostring),
+                   (.model.display_name // "" | tostring)] | @tsv' 2>/dev/null) || return 0
+    _cx_used=$(printf '%s' "$_cx" | cut -f1)
+    _cx_win=$(printf '%s' "$_cx" | cut -f2)
     # The harness's own variable is what its commit attribution links to, so it
     # wins; the status line's field covers a harness that does not export it.
-    _cx_remote=${CLAUDE_CODE_BRIDGE_SESSION_ID:-$(printf '%s' "$_cx" | cut -d' ' -f3)}
+    _cx_remote=${CLAUDE_CODE_BRIDGE_SESSION_ID:-$(printf '%s' "$_cx" | cut -f3)}
     status_remote_ok "$_cx_remote" || _cx_remote=''
+    # Both land on the card as text: a short word, and a short plain name.
+    _cx_effort=$(printf '%s' "$_cx" | cut -f4)
+    case "$_cx_effort" in '' | *[!a-z]*) _cx_effort=- ;; esac
+    [ "${#_cx_effort}" -le 12 ] || _cx_effort=-
+    _cx_model=$(printf '%s' "$_cx" | cut -f5 | tr -cd 'A-Za-z0-9 ._()-' | cut -c1-40)
+    _cx_model=$(printf '%s' "$_cx_model" | sed 's/^ *//; s/ *$//')
+    _cx_moved=''
+    if [ -n "$_cx_model" ]; then
+        _cx_mline="$_cx_effort $_cx_model"
+        [ "$(sed -n '1p' "$1/model" 2>/dev/null)" = "$_cx_mline" ] || status_put "$1/model" "$_cx_mline"
+        if [ -r "$1/posted" ] && [ "$(sed -n '1p' "$1/modelsent" 2>/dev/null)" != "$_cx_mline" ]; then
+            status_put "$1/modelsent" "$_cx_mline"
+            _cx_moved=1
+        fi
+    fi
     case "$_cx_used" in '' | *[!0-9]*) _cx_used='' ;; esac
     case "$_cx_win" in '' | *[!0-9]*) _cx_win=0 ;; esac
     _cx_was=$(status_field "$1/remote" 1)
@@ -1047,6 +1081,7 @@ status_context() {
     fi
     if [ -z "$_cx_used" ]; then
         rm -f "$1/context" 2>/dev/null
+        [ -z "$_cx_moved" ] || status_repost_async "$1"
         return 0
     fi
     [ "$(sed -n '1p' "$1/context" 2>/dev/null)" = "$_cx_used $_cx_win" ] ||
@@ -1061,7 +1096,7 @@ status_context() {
     [ -n "$_cx_posted" ] || _cx_posted=$(status_field "$1/posted" 3)
     case "$_cx_posted" in '' | *[!0-9]*) _cx_posted=0 ;; esac
     _cx_d=$((_cx_used - _cx_posted))
-    [ "${_cx_d#-}" -ge "$STATUS_CONTEXT_STEP" ] || return 0
+    [ "${_cx_d#-}" -ge "$STATUS_CONTEXT_STEP" ] || [ -n "$_cx_moved" ] || return 0
     status_put "$1/ctxsent" "$_cx_used"
     status_repost_async "$1"
 }

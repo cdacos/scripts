@@ -104,8 +104,8 @@ discard stdout. It costs a few milliseconds per tool call when nothing is due:
   "command":"agent-bus-cli.sh status --hook tool 2>/dev/null || true"}]}]}
 ```
 
-Each post can also say how full the session's context window is, and which
-Remote Control session it is, so the card can show a meter and link to the
+Each post can also say how full the session's context window is, its model
+and effort level, and which Remote Control session it is, so the card can show a meter and link to the
 conversation on claude.ai. Hooks are told neither; the status line is, so it
 passes its input on (the shared `dot_claude/statusline-command.sh` in the
 dotfiles does this; a box with its own status line adds the same line):

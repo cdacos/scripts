@@ -84,6 +84,10 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   one but never posts, so the card cannot flap. `CLAUDE_CODE_BRIDGE_SESSION_ID` (what the harness's
   commit attribution links to) beats the status line's `remote.session_id`; either must be
   `[A-Za-z0-9_-]`, because it ends up in a URL.
+- **Model and effort** ride them too, as `meta.model` (`model.display_name`, cut to
+  `[A-Za-z0-9 ._()-]`, 40 chars) and `meta.effort` (`effort.level`, `[a-z]`; absent for a model
+  without levels). Kept as `model` (`<effort|-> <name>`) in the state dir; a change from
+  `modelsent` (what the bus last heard) reposts at once, folded into the context repost if both moved.
 - **Waiting on the operator** rides the same posts as `meta.waiting` (`notified`, `permission`,
   `question`) + `waiting_since`, set by `status --hook waiting <kind>` from PostToolUse
   `PushNotification`, Notification `permission_prompt` and PreToolUse `AskUserQuestion`. Only the

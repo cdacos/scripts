@@ -249,6 +249,21 @@ allowed_roots() {
     done
 }
 
+# real_allowed <resolved path> -> "ok" when it lies under a prefix safe_path
+# allows. A function, not inline in safe_path's $( ): macOS /bin/sh (bash 3.2)
+# cannot parse a case pattern without its optional leading "(" inside a command
+# substitution, and shfmt strips that "(" -- so keep case out of $( ) entirely.
+real_allowed() {
+    allowed_roots | while IFS= read -r _base; do
+        case "$1" in
+            "$_base" | "$_base"/*)
+                printf 'ok\n'
+                break
+                ;;
+        esac
+    done
+}
+
 # safe_path <logical> -> resolved absolute path on stdout, non-zero if refused.
 safe_path() {
     _p="$1"
@@ -287,16 +302,7 @@ safe_path() {
     _real=$(canon "$_full")
     [ -n "$_real" ] || return 1
 
-    _hit=$(
-        allowed_roots | while IFS= read -r _base; do
-            case "$_real" in
-                "$_base" | "$_base"/*)
-                    printf 'ok\n'
-                    break
-                    ;;
-            esac
-        done
-    )
+    _hit=$(real_allowed "$_real")
     [ "$_hit" = "ok" ] || return 1
 
     printf '%s\n' "$_real"
@@ -955,6 +961,30 @@ logical_roots() {
     done
 }
 
+# top_logical <resolved repo root> -> its logical path ("/" for the served
+# root itself), nothing when no allowed prefix holds it. Kept out of
+# git_repo_root's $( ) for the bash 3.2 reason given at real_allowed.
+top_logical() {
+    logical_roots | while IFS="$TAB" read -r _lg _rs; do
+        [ -n "$_rs" ] || continue
+        case "$1" in
+            "$_rs")
+                printf '%s\n' "${_lg:-/}"
+                break
+                ;;
+            "$_rs"/*)
+                _sub="${1#"$_rs"/}"
+                if [ -n "$_lg" ]; then
+                    printf '%s/%s\n' "$_lg" "$_sub"
+                else
+                    printf '%s\n' "$_sub"
+                fi
+                break
+                ;;
+        esac
+    done
+}
+
 # git_repo_root <dir> -> the repo root as a logical path (empty when the served
 # root is itself a repo), non-zero when <dir> is in no repo this daemon serves.
 git_repo_root() {
@@ -976,26 +1006,7 @@ git_repo_root() {
     # "/" is the sentinel for "the served root itself", because an empty line
     # and no line at all are indistinguishable through a command substitution,
     # and it is the one byte a path component can never contain.
-    _hit=$(
-        logical_roots | while IFS="$TAB" read -r _lg _rs; do
-            [ -n "$_rs" ] || continue
-            case "$_top" in
-                "$_rs")
-                    printf '%s\n' "${_lg:-/}"
-                    break
-                    ;;
-                "$_rs"/*)
-                    _sub="${_top#"$_rs"/}"
-                    if [ -n "$_lg" ]; then
-                        printf '%s/%s\n' "$_lg" "$_sub"
-                    else
-                        printf '%s\n' "$_sub"
-                    fi
-                    break
-                    ;;
-            esac
-        done
-    )
+    _hit=$(top_logical "$_top")
     [ -n "$_hit" ] || return 1
     if [ "$_hit" = "/" ]; then
         printf '\n'

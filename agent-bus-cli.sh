@@ -830,6 +830,13 @@ status_publish() {
         _pb_remote=${CLAUDE_CODE_BRIDGE_SESSION_ID:-}
     fi
     status_remote_ok "$_pb_remote" || _pb_remote=''
+    # The branch's pull request, as `wake` last found it (status_pr_check). Only
+    # a cached answer: a hook never waits on GitHub.
+    _pb_pr=''
+    if [ -n "$_pb_branch" ] && [ "$(status_field "$1/pr" 1)" = "$_pb_branch" ]; then
+        _pb_pr=$(status_field "$1/pr" 2)
+        status_pr_ok "$_pb_pr" || _pb_pr=''
+    fi
     _pb_model=''
     [ -r "$1/model" ] && _pb_model=$(sed -n '1p' "$1/model" 2>/dev/null)
     _pb_effort=${_pb_model%% *}
@@ -846,7 +853,7 @@ status_publish() {
         --arg t "$_pb_task" --arg ta "$_pb_task_at" --arg h "$(bus_hostname)" \
         --arg b "$_pb_branch" --arg bp "$_pb_bpath" --arg w "$_pb_wait" --arg wa "$_pb_wait_at" \
         --arg c "$_pb_ctx" --arg cw "$_pb_ctxw" --arg r "$_pb_remote" \
-        --arg mo "$_pb_mname" --arg ef "$_pb_effort" \
+        --arg mo "$_pb_mname" --arg ef "$_pb_effort" --arg pr "$_pb_pr" \
         '{kind:"status", session:$s, state:$st, since:$since, task:$t, task_at:$ta, host:$h,
           branch:$b, branch_path:$bp}
          + if $w == "" then {} else {waiting:$w, waiting_since:$wa} end
@@ -854,7 +861,8 @@ status_publish() {
          + if $cw == "" or $c == "" then {} else {context_window:($cw | tonumber)} end
          + if $r == "" then {} else {remote_session:$r} end
          + if $mo == "" then {} else {model:$mo} end
-         + if $ef == "" or $mo == "" then {} else {effort:$ef} end')
+         + if $ef == "" or $mo == "" then {} else {effort:$ef} end
+         + if $pr == "" then {} else {pr:$pr} end')
     _pb_rc=1
     if api POST "/topics/$AGENT_STATUS_TOPIC" -d "$(payload "$_pb_body" "$_pb_meta")" >/dev/null 2>&1; then
         status_put "$1/posted" "$2 $3 ${_pb_ctx:--}"
@@ -1187,8 +1195,54 @@ status_branch_check() {
     case "$_bc_state" in working | idle) ;; *) return 0 ;; esac
     case "$_bc_since" in '' | *[!0-9]*) return 0 ;; esac
     _bc_git=$(status_branch)
-    [ "$_bc_git" = "$(cat "$_bc_dir/branch" 2>/dev/null)" ] && return 0
+    if [ "$_bc_git" = "$(cat "$_bc_dir/branch" 2>/dev/null)" ]; then
+        # Same branch: the one other thing that can change is its pull request.
+        status_pr_check "$_bc_dir" "$_bc_git" || return 0
+    fi
     status_publish "$_bc_dir" "$_bc_state" "$_bc_since" "$_bc_git" || true
+}
+
+# --- pull request: the branch's PR, for a direct link on the Fleet card. A
+# GitHub lookup costs a second or more, so only `wake` makes it, between polls,
+# and the answer is cached in <dir>/pr as "<branch> <url> <checked-epoch>"
+# (<url> is "-" for none). A found PR is kept for its branch; no PR yet is asked
+# again after STATUS_PR_RECHECK seconds. A new branch is posted first and looked
+# up on the next tick.
+STATUS_PR_RECHECK="${AGENT_STATUS_PR_RECHECK:-300}"
+STATUS_PR_TIMEOUT="${AGENT_STATUS_PR_TIMEOUT:-15}"
+
+# status_pr_ok <url> -- true for a github.com pull request URL and nothing else,
+# since it goes into a link on the card.
+status_pr_ok() {
+    printf '%s' "$1" | grep -Eqx 'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+'
+}
+
+# status_pr_check <dir> <branch-line> -- true when the cached PR for the branch
+# changed, so the caller re-posts. No branch, no worktree under the served root,
+# no gh, or a failed lookup: false, and a failure caches nothing.
+status_pr_check() {
+    _pc_br=$(printf '%s' "$2" | cut -f1)
+    _pc_path=$(printf '%s' "$2" | cut -s -f2)
+    [ -n "$_pc_br" ] && [ -n "$_pc_path" ] || return 1
+    command -v gh >/dev/null 2>&1 || return 1
+    _pc_now=$(date -u +%s)
+    _pc_old='-'
+    if [ "$(status_field "$1/pr" 1)" = "$_pc_br" ]; then
+        _pc_old=$(status_field "$1/pr" 2)
+        [ "$_pc_old" = "-" ] || return 1
+        _pc_at=$(status_field "$1/pr" 3)
+        case "$_pc_at" in '' | *[!0-9]*) _pc_at=0 ;; esac
+        [ $((_pc_now - _pc_at)) -ge "$STATUS_PR_RECHECK" ] || return 1
+    fi
+    _pc_wt="$STATUS_FS_ROOT/$_pc_path"
+    [ -d "$_pc_wt" ] || return 1
+    # Newest first, any state: a merged PR is still the branch's PR.
+    _pc_url=$(cd "$_pc_wt" 2>/dev/null &&
+        timeout "$STATUS_PR_TIMEOUT" gh pr list --head "$_pc_br" --state all --limit 1 \
+            --json url -q '.[0].url // empty' 2>/dev/null) || return 1
+    status_pr_ok "$_pc_url" || _pc_url='-'
+    status_put "$1/pr" "$_pc_br $_pc_url $_pc_now"
+    [ "$_pc_url" != "$_pc_old" ]
 }
 
 # status_prune -- drop state left by sessions that are provably gone (the same

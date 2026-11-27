@@ -76,6 +76,11 @@ POSIX-sh curl/jq client for the agent-bus HTTP API (service in `../agent-bus`). 
   `branch`/`branch_path`. These come from git, not from the session's cwd, which stays at the
   workdir. The CLI takes the most recently active worktree on a non-default branch under the
   served root, within 24 h. `wake`'s tick posts again only when that changes.
+- **Pull request** rides them as `meta.pr`, a `https://github.com/<owner>/<repo>/pull/<n>` URL and
+  nothing else. Only `wake`'s tick asks GitHub (`gh pr list --head`, any state, run in the
+  worktree, `AGENT_STATUS_PR_TIMEOUT` 15 s); hooks read the cache `pr` in the state dir
+  (`<branch> <url|-> <checked-epoch>`). A found PR is kept for its branch; none yet is asked again
+  after `AGENT_STATUS_PR_RECHECK` (300 s). A new branch is posted first, its PR on a later tick.
 - **Context and Remote Control** ride the same posts as `meta.context` (+ `context_window`) and
   `meta.remote_session`. Only the status line is told the context figure, so it pipes its JSON to
   `status --hook context`, which records both in the session's state dir and reposts only when the

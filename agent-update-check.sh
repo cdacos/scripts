@@ -359,13 +359,35 @@ guidance_drift() {
         _pending=${_pending:-unknown}
     fi
 
+    # A current source is not a current box. The scripts are chezmoi externals,
+    # fetched from their own repo, so a scripts-only change never moves this
+    # clone: stopping here left every box on the old agent-bus-cli.sh until the
+    # next dotfiles commit (2026-11-27, cfd8d0f9238c on all six peers). `chezmoi
+    # status` refreshes externals past their refreshPeriod, and a stale one
+    # shows in the second column (what apply would do). Any second-column entry
+    # counts, hand-edited ones ("MM") included: guidance_pullable then names the
+    # edit and refuses, where filtering it out here would read "current".
+    _stale=''
     if [ "$_behind" -eq 0 ] && [ -z "$_pending" ]; then
-        [ "$_fresh" = yes ] && log "guidance: current ($_head)"
-        return 0
+        _rc=0
+        _st=$(in_agent_env timeout "$AGENT_GUIDANCE_APPLY_TIMEOUT" \
+            chezmoi status --no-tty </dev/null 2>/dev/null) || _rc=$?
+        if [ "$_rc" -ne 0 ]; then
+            log "guidance: source current ($_head), but chezmoi status failed (exit $_rc) -- cannot tell whether externals are stale"
+            return 0
+        fi
+        _stale=$(printf '%s\n' "$_st" | grep '^.[^ ]' | cut -c4- | head -n 5 | tr '\n' ' ')
+        _stale=${_stale% }
+        if [ -z "$_stale" ]; then
+            [ "$_fresh" = yes ] && log "guidance: current ($_head)"
+            return 0
+        fi
     fi
 
     # Never report a bare count against a ref we did not just refresh.
-    if [ "$_behind" -eq 0 ]; then
+    if [ -n "$_stale" ]; then
+        _gap="source is current ($_head) but target(s) are stale: $_stale"
+    elif [ "$_behind" -eq 0 ]; then
         _gap="source is current ($_head) but NOT applied -- chezmoi apply of $_pending failed on an earlier tick"
     elif [ "$_fresh" = yes ]; then
         _gap="$_behind commit(s) behind -- HEAD $_head, origin/main $_remote"
@@ -417,7 +439,9 @@ guidance_drift() {
     rm -f "$GUIDANCE_UNAPPLIED"
     # Units may be among what was just written; main() reloaded before this ran.
     systemctl --user daemon-reload 2>/dev/null || true
-    if [ "$_behind" -eq 0 ]; then
+    if [ -n "$_stale" ]; then
+        log "guidance: source current ($_head); applied stale target(s): $_stale; sessions pick it up at their next start or /clear"
+    elif [ "$_behind" -eq 0 ]; then
         log "guidance: applied $_head (retry of a failed apply); sessions pick it up at their next start or /clear"
     else
         log "guidance: updated $_head -> $_remote and applied ($_behind commit(s)); sessions pick it up at their next start or /clear"
